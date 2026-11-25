@@ -94,6 +94,7 @@ const routes = [
   [/^#\/sinistres\/nouveau$/, () => viewForm(null), "sinistres"],
   [/^#\/sinistres\/(\d+)$/, (id) => viewDetail(id), "sinistres"],
   [/^#\/sinistres\/(\d+)\/modifier$/, (id) => viewForm(id), "sinistres"],
+  [/^#\/sinistres\/(\d+)\/courrier(?:\/(\w+))?$/, (id, m) => viewCourrier(id, m), "sinistres"],
   [/^#\/coproprietes$/, viewCopros, "coproprietes"],
   [/^#\/compte$/, viewAccount, "compte"],
   [/^#\/utilisateurs$/, viewUsers, "utilisateurs"],
@@ -250,7 +251,7 @@ async function viewAccount() {
 /* ------------------------------------------------------------------ */
 async function viewUsers(editId = null) {
   if (!isAdmin()) return ($app.innerHTML = '<div class="card">Accès réservé aux administrateurs.</div>');
-  const users = await api("/utilisateurs");
+  const [users, params] = await Promise.all([api("/utilisateurs"), api("/parametres")]);
   const cur = users.find((u) => u.id === editId) || { role: "gestionnaire", actif: 1 };
   const roleLabel = (r) => (r === "admin" ? "Administrateur" : "Gestionnaire");
 
@@ -282,6 +283,18 @@ async function viewUsers(editId = null) {
         )
         .join("")}</tbody>
     </table></div>
+    <form id="pform" class="card">
+      <h2>Coordonnées du cabinet (en-tête des courriers)</h2>
+      <div class="form-grid">
+        <div><label>Nom du cabinet</label><input name="cabinet_nom" value="${esc(params.cabinet_nom)}"></div>
+        <div><label>Ville (« Fait à … »)</label><input name="cabinet_ville" value="${esc(params.cabinet_ville)}"></div>
+        <div><label>Téléphone</label><input name="cabinet_telephone" value="${esc(params.cabinet_telephone)}"></div>
+        <div><label>Courriel</label><input name="cabinet_email" value="${esc(params.cabinet_email)}"></div>
+        <div class="full"><label>Adresse (plusieurs lignes possibles)</label><textarea name="cabinet_adresse" style="min-height:60px">${esc(params.cabinet_adresse)}</textarea></div>
+        <div class="full"><label>Mentions de bas de page (carte professionnelle, garantie financière, SIRET…)</label><textarea name="cabinet_mentions" style="min-height:60px">${esc(params.cabinet_mentions)}</textarea></div>
+      </div>
+      <button class="btn primary" style="margin-top:.75rem">Enregistrer les coordonnées</button>
+    </form>
     <div class="card">
       <h2>Sauvegarde</h2>
       <p class="muted">Télécharge une archive ZIP contenant la base de données et tous les documents joints. À conserver en lieu sûr (données personnelles).</p>
@@ -302,6 +315,15 @@ async function viewUsers(editId = null) {
     }
   };
   document.getElementById("u-cancel")?.addEventListener("click", () => viewUsers());
+  document.getElementById("pform").onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      await api("/parametres", { method: "PUT", body: Object.fromEntries(new FormData(e.target)) });
+      toast("Coordonnées du cabinet enregistrées.");
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
   $app.querySelectorAll("[data-uedit]").forEach((b) => b.addEventListener("click", () => viewUsers(Number(b.dataset.uedit))));
 }
 
@@ -464,6 +486,7 @@ async function viewDetail(id) {
       <div class="actions">
         <a class="btn" href="#/sinistres">← Liste</a>
         <button class="btn" id="print">Imprimer</button>
+        <a class="btn" href="#/sinistres/${s.id}/courrier">✉ Courrier</a>
         <a class="btn primary" href="#/sinistres/${s.id}/modifier">Modifier</a>
         ${isAdmin() ? '<button class="btn danger" id="del">Supprimer</button>' : ""}
       </div>
@@ -796,6 +819,7 @@ async function viewCopros(editId = null) {
       <div class="form-grid">
         ${f("nom", "Nom *")}${f("adresse", "Adresse")}
         ${f("assureur", "Assureur multirisque immeuble")}${f("numero_police", "N° de police")}
+        ${f("assureur_adresse", "Adresse postale de l'assureur (service sinistres)")}${f("assureur_email", "Courriel de l'assureur (sinistres)")}
         ${f("courtier", "Courtier")}${f("notes", "Notes")}
       </div>
       <div class="actions" style="margin-top:.9rem">

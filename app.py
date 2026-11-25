@@ -165,9 +165,18 @@ MIGRATIONS = [
     ALTER TABLE journal ADD COLUMN auteur_id INTEGER REFERENCES utilisateurs(id);
     ALTER TABLE documents ADD COLUMN auteur_id INTEGER REFERENCES utilisateurs(id);
     """,
+    # v4 — paramètres du cabinet (courriers) et coordonnées de l'assureur
+    """
+    CREATE TABLE parametres (cle TEXT PRIMARY KEY, valeur TEXT NOT NULL DEFAULT '');
+    ALTER TABLE coproprietes ADD COLUMN assureur_adresse TEXT DEFAULT '';
+    ALTER TABLE coproprietes ADD COLUMN assureur_email TEXT DEFAULT '';
+    """,
 ]
 
-COPRO_FIELDS = ["nom", "adresse", "assureur", "numero_police", "courtier", "notes"]
+COPRO_FIELDS = ["nom", "adresse", "assureur", "assureur_adresse", "assureur_email",
+                "numero_police", "courtier", "notes"]
+PARAMETRES = ["cabinet_nom", "cabinet_adresse", "cabinet_telephone", "cabinet_email",
+              "cabinet_ville", "cabinet_mentions"]
 SINISTRE_FIELDS = [
     "copropriete_id", "type", "statut", "date_survenance", "date_constat",
     "date_declaration", "localisation", "parties", "declarant", "declarant_contact",
@@ -742,6 +751,30 @@ def api_backup(ctx):
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
     return Raw(path=zpath, ctype="application/zip", cleanup=tmpdir, headers={
         "Content-Disposition": f'attachment; filename="sauvegarde-sinistres-{stamp}.zip"'})
+
+
+# -- Paramètres du cabinet --
+def get_parametres(conn):
+    out = {k: "" for k in PARAMETRES}
+    for r in conn.execute("SELECT cle, valeur FROM parametres"):
+        out[r["cle"]] = r["valeur"]
+    return out
+
+
+@route("GET", "/api/parametres")
+def api_params(ctx):
+    return get_parametres(ctx.conn)
+
+
+@route("PUT", "/api/parametres", admin=True)
+def api_params_update(ctx):
+    data = ctx.json()
+    for k in PARAMETRES:
+        if k in data:
+            ctx.conn.execute("INSERT INTO parametres (cle, valeur) VALUES (?, ?) "
+                             "ON CONFLICT(cle) DO UPDATE SET valeur = excluded.valeur",
+                             (k, str(data[k] or "").strip()[:2000]))
+    return get_parametres(ctx.conn)
 
 
 @route("GET", "/api/meta")

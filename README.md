@@ -43,6 +43,11 @@ L'administrateur ajoute ensuite les comptes de ses collègues depuis le menu « 
 - Gestion des **copropriétés** (assureur MRI, n° de police, courtier) ; l'assureur est
   pré-rempli à la création d'un sinistre.
 
+- **Courriers types** générés depuis le dossier, modifiables avant envoi : déclaration à
+  l'assureur, relance de l'assureur, courrier à l'expert, information au déclarant,
+  demande de devis, mise en cause du responsable présumé. En-tête aux coordonnées du
+  cabinet (Administration), option LRAR, liste des pièces jointes, impression / PDF,
+  copie du texte, ouverture dans la messagerie, envoi noté au journal.
 - **Comptes utilisateurs** : connexion par identifiant / mot de passe, rôles
   *Administrateur* (gestion des comptes, sauvegarde, suppressions) et *Gestionnaire* ;
   l'auteur de chaque action est indiqué dans le journal.

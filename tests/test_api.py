@@ -274,6 +274,20 @@ class ApiTest(unittest.TestCase):
         self.assertIn("sinistres.db", names)
         self.assertTrue(any(n.startswith(f"documents/{s['id']}/") for n in names))
 
+    def test_parametres(self):
+        st, p = self.call("PUT", "/api/parametres", {"cabinet_nom": "Cabinet Dupont",
+                                                     "cabinet_ville": "Lyon", "inconnu": "x"})
+        self.assertEqual(st, 200)
+        self.assertEqual(p["cabinet_nom"], "Cabinet Dupont")
+        self.assertNotIn("inconnu", p)
+        st, p = self.call("GET", "/api/parametres")
+        self.assertEqual(p["cabinet_ville"], "Lyon")
+        st, c = self.call("POST", "/api/coproprietes", {"nom": "Le Parc",
+                                                        "assureur_adresse": "1 rue X, Paris"})
+        st, lst = self.call("GET", "/api/coproprietes")
+        self.assertEqual(next(x for x in lst if x["id"] == c["id"])["assureur_adresse"],
+                         "1 rue X, Paris")
+
     def test_page_accueil(self):
         with urllib.request.urlopen(self.base + "/") as r:
             self.assertIn(b"Suivi des sinistres", r.read())

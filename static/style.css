@@ -179,3 +179,42 @@ dl.details dd { margin: 0; white-space: pre-wrap; }
 body.anon .topbar nav, body.anon .topbar > .btn, body.anon .usermenu { display: none; }
 .auth-card { max-width: 420px; margin: 3rem auto; }
 tr.muted td { color: var(--muted); }
+
+/* Courriers */
+.courrier-layout { display: grid; grid-template-columns: 280px 1fr; gap: 1rem; align-items: start; }
+.courrier-side h2 { font-size: .95rem; margin: 1rem 0 .5rem; }
+.courrier-side h2:first-child { margin-top: 0; }
+.modeles { list-style: none; padding: 0; margin: 0; }
+.modeles a { display: block; padding: .35rem .5rem; border-radius: 4px; color: var(--text); font-size: .9rem; }
+.modeles a.active { background: var(--primary-soft); color: var(--primary); font-weight: 600; }
+label.check { display: flex; gap: .4rem; align-items: flex-start; color: var(--text); font-size: .88rem; margin-bottom: .3rem; }
+label.check input { width: auto; margin-top: .2rem; }
+.sheet-wrap { overflow-x: auto; }
+.sheet {
+  background: #fff; color: #111; width: 210mm; min-height: 297mm; padding: 20mm 20mm 18mm;
+  margin: 0 auto; box-shadow: 0 2px 12px rgba(0,0,0,.12); font: 11pt/1.45 Georgia, "Times New Roman", serif;
+  outline: none; position: relative;
+}
+.sheet:focus { box-shadow: 0 0 0 2px var(--primary), 0 2px 12px rgba(0,0,0,.12); }
+.sheet .exp { margin-bottom: 1.5rem; }
+.sheet .dest { margin: 0 0 1.5rem 55%; min-height: 3.5rem; }
+.sheet .lieu-date { text-align: right; }
+.sheet .refs { font-size: 10pt; margin: 1rem 0; }
+.sheet .objet { margin: 1rem 0; }
+.sheet p { margin: 0 0 .7rem; text-align: justify; }
+.sheet ul { margin: 0 0 .7rem; }
+.sheet .signature { margin: 2rem 0 0 55%; }
+.sheet .pj { margin-top: 2rem; font-size: 10pt; }
+.sheet .mentions { position: absolute; bottom: 10mm; left: 20mm; right: 20mm; font-size: 8pt; color: #555; text-align: center; border-top: 1px solid #ccc; padding-top: 2mm; }
+mark { background: #fff1a8; color: inherit; padding: 0 .15em; border-radius: 2px; }
+@media (max-width: 900px) {
+  .courrier-layout { grid-template-columns: 1fr; }
+}
+@media print {
+  @page { size: A4; margin: 15mm 18mm; }
+  main { padding: 0; max-width: none; }
+  .courrier-layout { display: block; }
+  .sheet { box-shadow: none; margin: 0; width: auto; min-height: 0; padding: 0; }
+  .sheet .mentions { position: static; margin-top: 2rem; }
+  mark { background: none; }
+}

@@ -61,7 +61,7 @@ function toast(msg, isError = false) {
 }
 
 async function api(path, options = {}) {
-  const opts = { ...options, headers: { "Content-Type": "application/json" } };
+  const opts = { ...options, headers: { "Content-Type": "application/json", "X-Requested-With": "fetch" } };
   if (opts.body && typeof opts.body !== "string") opts.body = JSON.stringify(opts.body);
   const res = await fetch("/api" + path, opts);
   const data = await res.json().catch(() => ({}));
@@ -211,7 +211,7 @@ async function viewList() {
       ? rows
           .map(
             (s) => `<tr data-id="${s.id}">
-        <td><strong>${esc(s.reference)}</strong></td><td>${esc(s.copropriete_nom || "—")}</td>
+        <td><strong>${esc(s.reference)}</strong>${s.nb_documents ? ` <span class="muted" title="${s.nb_documents} document(s)">📎${s.nb_documents}</span>` : ""}</td><td>${esc(s.copropriete_nom || "—")}</td>
         <td>${esc(s.type)}</td><td>${esc(s.localisation)}</td><td>${fmtDate(s.date_survenance)}</td>
         <td>${badge(s.statut)}</td><td class="${isLate(s) ? "late" : ""}">${fmtDate(s.date_echeance)}</td>
         <td class="num">${fmtMoney(s.montant_estime)}</td></tr>`
@@ -268,7 +268,7 @@ async function viewDetail(id) {
       </div>
       <div class="actions">
         <a class="btn" href="#/sinistres">← Liste</a>
-        <button class="btn" onclick="window.print()">Imprimer</button>
+        <button class="btn" id="print">Imprimer</button>
         <a class="btn primary" href="#/sinistres/${s.id}/modifier">Modifier</a>
         <button class="btn danger" id="del">Supprimer</button>
       </div>
@@ -305,6 +305,17 @@ async function viewDetail(id) {
         ${solde !== null ? row("Reste à charge (devis − indemnité)", fmtMoney(solde)) : ""}
         ${row("Clôturé le", fmtDate(s.date_cloture))}
       </dl></div>
+      <div class="card" id="docs-card"><h2>Documents (${s.documents.length})</h2>
+        <div class="dropzone no-print" id="dropzone">
+          <p>Glissez-déposez des fichiers ici (photos, constat, rapport, devis…)</p>
+          <div class="actions" style="justify-content:center">
+            <select id="doc-cat">${META.doc_categories.map((c) => `<option>${esc(c)}</option>`).join("")}</select>
+            <label class="btn" style="margin:0">Choisir des fichiers<input type="file" id="doc-input" multiple hidden></label>
+          </div>
+          <div id="upload-status" class="hint"></div>
+        </div>
+        ${renderDocs(s.documents)}
+      </div>
       <div class="card"><h2>Journal de suivi</h2>
         <form id="jform" class="no-print" style="margin-bottom:1rem">
           <div class="form-grid">
@@ -326,6 +337,8 @@ async function viewDetail(id) {
       </div>
     </div>`;
 
+  document.getElementById("print").onclick = () => window.print();
+  bindDocs(s, () => viewDetail(id));
   document.getElementById("del").onclick = async () => {
     if (!confirm(`Supprimer définitivement le dossier ${s.reference} et son journal ?`)) return;
     await api(`/sinistres/${s.id}`, { method: "DELETE" });
@@ -348,6 +361,114 @@ async function viewDetail(id) {
       if (!confirm("Supprimer cette entrée du journal ?")) return;
       await api(`/journal/${b.dataset.jdel}`, { method: "DELETE" });
       viewDetail(id);
+    })
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Documents                                                           */
+/* ------------------------------------------------------------------ */
+function fmtSize(n) {
+  if (n < 1024) return `${n} o`;
+  if (n < 1048576) return `${(n / 1024).toFixed(0)} Ko`;
+  return `${(n / 1048576).toFixed(1).replace(".", ",")} Mo`;
+}
+const isImage = (d) => /^image\/(png|jpeg|gif|webp)$/.test(d.mime);
+function docIcon(d) {
+  if (d.mime === "application/pdf") return "PDF";
+  const ext = (d.nom.split(".").pop() || "").toUpperCase();
+  return ext.length <= 5 ? ext : "FICHIER";
+}
+
+function renderDocs(docs) {
+  if (!docs.length) return '<p class="muted">Aucun document.</p>';
+  const groups = {};
+  docs.forEach((d) => (groups[d.categorie] = groups[d.categorie] || []).push(d));
+  return Object.entries(groups)
+    .map(([cat, list]) => `<h3 class="doc-cat">${esc(cat)} <span class="muted">(${list.length})</span></h3>
+      <div class="docs">${list
+        .map(
+          (d) => `<div class="doc">
+          <a class="doc-thumb" href="/api/documents/${d.id}" target="_blank" rel="noopener" title="Ouvrir">
+            ${isImage(d) ? `<img src="/api/documents/${d.id}" alt="" loading="lazy">` : `<span>${esc(docIcon(d))}</span>`}
+          </a>
+          <div class="doc-name" title="${esc(d.nom)}">${esc(d.nom)}</div>
+          <div class="doc-meta">${fmtDate(d.created_at)} · ${fmtSize(d.taille)}</div>
+          <div class="doc-actions no-print">
+            <a class="btn small" href="/api/documents/${d.id}?download=1" title="Télécharger">⬇</a>
+            <select class="doc-recat" data-id="${d.id}" title="Changer de catégorie">${META.doc_categories
+              .map((c) => `<option ${c === d.categorie ? "selected" : ""}>${esc(c)}</option>`)
+              .join("")}</select>
+            <button class="btn small danger" data-docdel="${d.id}" title="Supprimer">✕</button>
+          </div>
+        </div>`
+        )
+        .join("")}</div>`)
+    .join("");
+}
+
+async function uploadFiles(sinistreId, files, categorie, statusEl) {
+  let ok = 0;
+  const errors = [];
+  for (const [i, f] of [...files].entries()) {
+    statusEl.textContent = `Envoi ${i + 1}/${files.length} : ${f.name}…`;
+    if (f.size > META.max_upload) {
+      errors.push(`${f.name} : trop volumineux (max ${fmtSize(META.max_upload)})`);
+      continue;
+    }
+    try {
+      const res = await fetch(`/api/sinistres/${sinistreId}/documents`, {
+        method: "POST",
+        body: f,
+        headers: {
+          "Content-Type": f.type || "application/octet-stream",
+          "X-Filename": encodeURIComponent(f.name),
+          "X-Categorie": encodeURIComponent(categorie),
+          "X-Requested-With": "fetch",
+        },
+      });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).erreur || `Erreur ${res.status}`);
+      ok++;
+    } catch (e) {
+      errors.push(`${f.name} : ${e.message}`);
+    }
+  }
+  statusEl.textContent = "";
+  if (ok) toast(`${ok} document(s) ajouté(s).`);
+  if (errors.length) toast(errors.join(" — "), true);
+  return ok;
+}
+
+function bindDocs(s, reload) {
+  const zone = document.getElementById("dropzone");
+  const input = document.getElementById("doc-input");
+  const status = document.getElementById("upload-status");
+  const cat = document.getElementById("doc-cat");
+  const send = async (files) => {
+    if (!files.length) return;
+    if (await uploadFiles(s.id, files, cat.value, status)) reload();
+  };
+  input.addEventListener("change", () => send(input.files));
+  ["dragenter", "dragover"].forEach((ev) =>
+    zone.addEventListener(ev, (e) => { e.preventDefault(); zone.classList.add("over"); }));
+  ["dragleave", "drop"].forEach((ev) =>
+    zone.addEventListener(ev, (e) => { e.preventDefault(); zone.classList.remove("over"); }));
+  zone.addEventListener("drop", (e) => send(e.dataTransfer.files));
+
+  document.querySelectorAll("[data-docdel]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const d = s.documents.find((x) => x.id === Number(b.dataset.docdel));
+      if (!confirm(`Supprimer le document « ${d.nom} » ?`)) return;
+      await api(`/documents/${d.id}`, { method: "DELETE" });
+      toast("Document supprimé.");
+      reload();
+    })
+  );
+  document.querySelectorAll(".doc-recat").forEach((sel) =>
+    sel.addEventListener("change", async () => {
+      await api(`/documents/${sel.dataset.id}`, { method: "PUT", body: { categorie: sel.value } });
+      toast("Catégorie modifiée.");
+      reload();
     })
   );
 }

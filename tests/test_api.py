@@ -18,6 +18,7 @@ class ApiTest(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
         app.DB_PATH = os.path.join(cls.tmp.name, "test.db")
+        app.DOCS_DIR = os.path.join(cls.tmp.name, "docs")
         app.init_db()
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
         cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
@@ -29,17 +30,77 @@ class ApiTest(unittest.TestCase):
         cls.server.server_close()
         cls.tmp.cleanup()
 
-    def call(self, method, path, body=None):
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(self.base + path, data=data, method=method,
-                                     headers={"Content-Type": "application/json"})
+    def call(self, method, path, body=None, raw=None, headers=None):
+        data = json.dumps(body).encode() if body is not None else raw
+        hdrs = {"Content-Type": "application/json", "X-Requested-With": "fetch"}
+        hdrs.update(headers or {})
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers=hdrs)
         try:
             with urllib.request.urlopen(req) as r:
-                raw = r.read()
+                content = r.read()
+                self.last_headers = r.headers
                 ctype = r.headers.get("Content-Type", "")
-                return r.status, (json.loads(raw) if "json" in ctype else raw)
+                return r.status, (json.loads(content) if "json" in ctype else content)
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
+
+    def upload(self, sid, name, content, mime, categorie="Photo"):
+        from urllib.parse import quote
+        return self.call("POST", f"/api/sinistres/{sid}/documents", raw=content, headers={
+            "Content-Type": mime, "X-Filename": quote(name), "X-Categorie": quote(categorie)})
+
+    def test_documents(self):
+        st, s = self.call("POST", "/api/sinistres", {"type": "Bris de glace", "statut": "Déclaré"})
+        sid = s["id"]
+        png = b"\x89PNG\r\n\x1a\n" + b"x" * 100
+        st, d = self.upload(sid, "photo hall été.png", png, "image/png")
+        self.assertEqual(st, 201)
+        st, body = self.call("GET", f"/api/documents/{d['id']}")
+        self.assertEqual(body, png)
+        self.assertEqual(self.last_headers["Content-Type"], "image/png")
+        self.assertTrue(self.last_headers["Content-Disposition"].startswith("inline"))
+
+        # Un fichier HTML n'est jamais servi tel quel (protection XSS)
+        st, h = self.upload(sid, "../../piege.html", b"<script>alert(1)</script>", "text/html",
+                            "Autre")
+        self.assertEqual(st, 201)
+        self.assertEqual(h["nom"], "piege.html")
+        self.call("GET", f"/api/documents/{h['id']}")
+        self.assertEqual(self.last_headers["Content-Type"], "application/octet-stream")
+        self.assertTrue(self.last_headers["Content-Disposition"].startswith("attachment"))
+
+        st, err = self.upload(sid, "x.pdf", b"%PDF", "application/pdf", "Inconnue")
+        self.assertEqual(st, 400)
+
+        st, full = self.call("GET", f"/api/sinistres/{sid}")
+        self.assertEqual(len(full["documents"]), 2)
+        self.assertEqual(full["nb_documents"], 2)
+        self.assertTrue(any("Document ajouté" in j["commentaire"] for j in full["journal"]))
+
+        st, _ = self.call("PUT", f"/api/documents/{d['id']}", {"categorie": "Constat amiable"})
+        self.assertEqual(st, 200)
+        st, _ = self.call("DELETE", f"/api/documents/{h['id']}")
+        self.assertEqual(st, 200)
+        folder = os.path.join(app.DOCS_DIR, str(sid))
+        self.assertEqual(len(os.listdir(folder)), 1)
+        self.call("DELETE", f"/api/sinistres/{sid}")
+        self.assertFalse(os.path.exists(folder))
+
+    def test_migration_base_v1(self):
+        """Une base créée par la première version est mise à niveau sans perte."""
+        import sqlite3
+        path = os.path.join(self.tmp.name, "ancienne.db")
+        conn = sqlite3.connect(path)
+        conn.executescript(app.MIGRATIONS[0])
+        conn.execute("INSERT INTO sinistres (reference, type, statut, created_at, updated_at) "
+                     "VALUES ('SIN-2026-0001', 'Incendie', 'Déclaré', '2026-01-01', '2026-01-01')")
+        conn.commit()
+        conn.close()
+        app.init_db(path)
+        conn = app.connect(path)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], len(app.MIGRATIONS))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM sinistres").fetchone()[0], 1)
+        conn.close()
 
     def test_parcours_complet(self):
         st, c = self.call("POST", "/api/coproprietes", {"nom": "Résidence Les Tilleuls",

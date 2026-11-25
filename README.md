@@ -27,6 +27,9 @@ Sous Windows : installer Python depuis python.org, puis double-cliquer sur `app.
   indemnité), prochaine action et échéance.
 - **Statuts** : À déclarer → Déclaré → En attente d'expertise → Expertise réalisée →
   Devis / Travaux → Indemnisation en cours → Clôturé (ou Refusé / Sans suite).
+- **Documents** joints à chaque dossier (photos, constat amiable, rapport d'expertise, devis,
+  factures, courriers…) : glisser-déposer, classement par catégorie, aperçu des photos,
+  25 Mo maximum par fichier (réglable avec `SINISTRES_MAX_UPLOAD_MO`).
 - **Journal de suivi** par dossier (appels, courriels, relances, expertise…), avec
   traçage automatique des changements de statut.
 - **Alertes de délai de déclaration** (5 jours ouvrés en général, 2 jours ouvrés pour le vol)
@@ -39,9 +42,11 @@ Sous Windows : installer Python depuis python.org, puis double-cliquer sur `app.
 
 ## Sauvegarde
 
-Toutes les données sont dans `sinistres.db`. Pour sauvegarder, copiez ce fichier
-(application arrêtée de préférence). Pour changer son emplacement :
-`SINISTRES_DB=/chemin/vers/sinistres.db python3 app.py`.
+Les données sont dans `sinistres.db` et les pièces jointes dans le dossier `documents/`.
+Pour sauvegarder, copiez **ces deux éléments** (application arrêtée de préférence).
+Pour changer leur emplacement : `SINISTRES_DB=/chemin/sinistres.db SINISTRES_DOCS=/chemin/documents python3 app.py`.
+
+Une base créée par une version précédente est mise à niveau automatiquement au démarrage.
 
 ## Tests
 

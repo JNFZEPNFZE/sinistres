@@ -170,4 +170,12 @@ dl.details dd { margin: 0; white-space: pre-wrap; }
 .doc-meta { font-size: .75rem; color: var(--muted); }
 .doc-actions { display: flex; gap: .25rem; align-items: center; }
 .doc-actions select { padding: .15rem .25rem; font-size: .75rem; min-width: 0; flex: 1; }
-#docs-card { grid-column: 1 / -1; }
+#docs-card, #journal-card { grid-column: 1 / -1; }
+
+/* Comptes */
+.usermenu { display: flex; gap: .75rem; align-items: center; font-size: .9rem; }
+.usermenu a { color: var(--muted); }
+.usermenu a.active { color: var(--text); }
+body.anon .topbar nav, body.anon .topbar > .btn, body.anon .usermenu { display: none; }
+.auth-card { max-width: 420px; margin: 3rem auto; }
+tr.muted td { color: var(--muted); }

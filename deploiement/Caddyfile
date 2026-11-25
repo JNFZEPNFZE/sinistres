@@ -1,0 +1,9 @@
+# Exemple de configuration Caddy (https://caddyserver.com) : HTTPS automatique.
+# Remplacez le nom de domaine, puis : sudo caddy run --config Caddyfile
+sinistres.mon-cabinet.fr {
+	encode gzip
+	request_body {
+		max_size 30MB
+	}
+	reverse_proxy 127.0.0.1:8000
+}

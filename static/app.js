@@ -5,6 +5,8 @@
 /* ------------------------------------------------------------------ */
 const $app = document.getElementById("app");
 let META = null;
+let ME = null; // utilisateur connecté
+const isAdmin = () => ME && ME.role === "admin";
 
 const CONVENTIONS = [
   "",
@@ -65,6 +67,10 @@ async function api(path, options = {}) {
   if (opts.body && typeof opts.body !== "string") opts.body = JSON.stringify(opts.body);
   const res = await fetch("/api" + path, opts);
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && data.auth && ME) {
+    ME = null;
+    boot();
+  }
   if (!res.ok) throw new Error(data.erreur || `Erreur ${res.status}`);
   return data;
 }
@@ -89,9 +95,12 @@ const routes = [
   [/^#\/sinistres\/(\d+)$/, (id) => viewDetail(id), "sinistres"],
   [/^#\/sinistres\/(\d+)\/modifier$/, (id) => viewForm(id), "sinistres"],
   [/^#\/coproprietes$/, viewCopros, "coproprietes"],
+  [/^#\/compte$/, viewAccount, "compte"],
+  [/^#\/utilisateurs$/, viewUsers, "utilisateurs"],
 ];
 
 async function router() {
+  if (!ME) return;
   if (!META) META = await api("/meta");
   const hash = location.hash || "#/";
   for (const [re, fn, nav] of routes) {
@@ -110,7 +119,193 @@ async function router() {
   $app.innerHTML = `<div class="card">Page introuvable. <a href="#/">Retour</a></div>`;
 }
 window.addEventListener("hashchange", router);
-router();
+
+/* ------------------------------------------------------------------ */
+/* Connexion / premier lancement                                       */
+/* ------------------------------------------------------------------ */
+function renderUserMenu() {
+  const el = document.getElementById("usermenu");
+  document.body.classList.toggle("anon", !ME);
+  el.innerHTML = ME
+    ? `${isAdmin() ? '<a href="#/utilisateurs" data-nav="utilisateurs">Administration</a>' : ""}
+       <a href="#/compte" data-nav="compte" title="Mon compte">${esc(ME.nom)}</a>
+       <button class="btn small" id="logout">Déconnexion</button>`
+    : "";
+  document.getElementById("logout")?.addEventListener("click", async () => {
+    await api("/deconnexion", { method: "POST" }).catch(() => {});
+    ME = null;
+    boot();
+  });
+}
+
+async function boot() {
+  let ses;
+  try {
+    ses = await api("/session");
+  } catch (e) {
+    $app.innerHTML = `<div class="card late">Serveur injoignable : ${esc(e.message)}</div>`;
+    return;
+  }
+  ME = ses.utilisateur;
+  renderUserMenu();
+  if (ME) return router();
+  if (ses.installation) return viewSetup();
+  viewLogin();
+}
+
+function viewLogin() {
+  $app.innerHTML = `
+    <form id="login" class="card auth-card">
+      <h1>Connexion</h1>
+      <label for="l-id">Identifiant</label>
+      <input id="l-id" name="identifiant" autocomplete="username" required autofocus>
+      <label for="l-pw" style="margin-top:.75rem">Mot de passe</label>
+      <input id="l-pw" name="mot_de_passe" type="password" autocomplete="current-password" required>
+      <div id="l-err" class="late" style="margin-top:.75rem"></div>
+      <button class="btn primary" style="margin-top:1rem;width:100%">Se connecter</button>
+    </form>`;
+  document.getElementById("login").onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const r = await api("/connexion", { method: "POST", body: Object.fromEntries(new FormData(e.target)) });
+      ME = r.utilisateur;
+      renderUserMenu();
+      router();
+    } catch (err) {
+      document.getElementById("l-err").textContent = err.message;
+    }
+  };
+}
+
+function viewSetup() {
+  $app.innerHTML = `
+    <form id="setup" class="card auth-card">
+      <h1>Bienvenue</h1>
+      <p class="muted">Créez le compte administrateur. Vous pourrez ensuite ajouter vos collègues depuis « Administration ».</p>
+      <div class="form-grid" style="grid-template-columns:1fr">
+        <div><label>Nom complet</label><input name="nom" required autofocus></div>
+        <div><label>Identifiant de connexion</label><input name="identifiant" required autocomplete="username" placeholder="ex. : prenom.nom"></div>
+        <div><label>Courriel</label><input name="email" type="email"></div>
+        <div><label>Mot de passe (8 caractères minimum)</label><input name="mot_de_passe" type="password" minlength="8" required autocomplete="new-password"></div>
+        <div><label>Confirmer le mot de passe</label><input name="confirmation" type="password" required autocomplete="new-password"></div>
+      </div>
+      <div id="s-err" class="late" style="margin-top:.75rem"></div>
+      <button class="btn primary" style="margin-top:1rem;width:100%">Créer le compte</button>
+    </form>`;
+  document.getElementById("setup").onsubmit = async (e) => {
+    e.preventDefault();
+    const data = Object.fromEntries(new FormData(e.target));
+    const err = document.getElementById("s-err");
+    if (data.mot_de_passe !== data.confirmation) return (err.textContent = "Les mots de passe ne correspondent pas.");
+    try {
+      const r = await api("/installation", { method: "POST", body: data });
+      ME = r.utilisateur;
+      renderUserMenu();
+      location.hash = "#/";
+      router();
+    } catch (ex) {
+      err.textContent = ex.message;
+    }
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Mon compte                                                          */
+/* ------------------------------------------------------------------ */
+async function viewAccount() {
+  $app.innerHTML = `
+    <h1>Mon compte</h1>
+    <form id="acc" class="card" style="max-width:640px">
+      <div class="form-grid">
+        <div><label>Identifiant</label><input value="${esc(ME.identifiant)}" disabled></div>
+        <div><label>Rôle</label><input value="${ME.role === "admin" ? "Administrateur" : "Gestionnaire"}" disabled></div>
+        <div><label>Nom complet</label><input name="nom" value="${esc(ME.nom)}" required></div>
+        <div><label>Courriel</label><input name="email" type="email" value="${esc(ME.email)}"></div>
+      </div>
+      <h2 style="margin-top:1.5rem">Changer de mot de passe</h2>
+      <div class="form-grid">
+        <div><label>Mot de passe actuel</label><input name="ancien_mot_de_passe" type="password" autocomplete="current-password"></div>
+        <div><label>Nouveau mot de passe</label><input name="nouveau_mot_de_passe" type="password" minlength="8" autocomplete="new-password"></div>
+      </div>
+      <p class="hint">Laissez vide pour conserver le mot de passe actuel. Les autres appareils connectés seront déconnectés.</p>
+      <button class="btn primary">Enregistrer</button>
+    </form>`;
+  document.getElementById("acc").onsubmit = async (e) => {
+    e.preventDefault();
+    const data = Object.fromEntries(new FormData(e.target));
+    try {
+      await api("/moi", { method: "PUT", body: data });
+      Object.assign(ME, { nom: data.nom, email: data.email });
+      renderUserMenu();
+      toast("Compte mis à jour.");
+      viewAccount();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Administration : utilisateurs et sauvegarde                         */
+/* ------------------------------------------------------------------ */
+async function viewUsers(editId = null) {
+  if (!isAdmin()) return ($app.innerHTML = '<div class="card">Accès réservé aux administrateurs.</div>');
+  const users = await api("/utilisateurs");
+  const cur = users.find((u) => u.id === editId) || { role: "gestionnaire", actif: 1 };
+  const roleLabel = (r) => (r === "admin" ? "Administrateur" : "Gestionnaire");
+
+  $app.innerHTML = `
+    <h1>Administration</h1>
+    <form id="uform" class="card">
+      <h2>${editId ? `Modifier ${esc(cur.nom)}` : "Ajouter un utilisateur"}</h2>
+      <div class="form-grid">
+        <div><label>Nom complet *</label><input name="nom" value="${esc(cur.nom || "")}" required></div>
+        <div><label>Identifiant *</label><input name="identifiant" value="${esc(cur.identifiant || "")}" ${editId ? "disabled" : "required"} placeholder="prenom.nom"></div>
+        <div><label>Courriel</label><input name="email" type="email" value="${esc(cur.email || "")}"></div>
+        <div><label>Rôle</label><select name="role">${["gestionnaire", "admin"].map((r) => `<option value="${r}" ${r === cur.role ? "selected" : ""}>${roleLabel(r)}</option>`).join("")}</select></div>
+        <div><label>${editId ? "Nouveau mot de passe (laisser vide pour ne pas changer)" : "Mot de passe provisoire *"}</label>
+          <input name="mot_de_passe" type="password" minlength="8" autocomplete="new-password" ${editId ? "" : "required"}></div>
+        ${editId ? `<div><label>Compte</label><select name="actif"><option value="1" ${cur.actif ? "selected" : ""}>Actif</option><option value="" ${cur.actif ? "" : "selected"}>Désactivé</option></select></div>` : ""}
+      </div>
+      <p class="hint">Les administrateurs gèrent les comptes, la sauvegarde et peuvent supprimer des dossiers et des copropriétés.</p>
+      <div class="actions"><button class="btn primary">${editId ? "Enregistrer" : "Créer le compte"}</button>
+        ${editId ? '<button type="button" class="btn" id="u-cancel">Annuler</button>' : ""}</div>
+    </form>
+    <div class="card table-wrap" style="padding:0"><table>
+      <thead><tr><th>Nom</th><th>Identifiant</th><th>Courriel</th><th>Rôle</th><th>Dernière connexion</th><th></th></tr></thead>
+      <tbody>${users
+        .map(
+          (u) => `<tr class="${u.actif ? "" : "muted"}"><td><strong>${esc(u.nom)}</strong>${u.actif ? "" : " (désactivé)"}</td>
+          <td>${esc(u.identifiant)}</td><td>${esc(u.email)}</td><td>${roleLabel(u.role)}</td>
+          <td>${u.derniere_connexion ? fmtDate(u.derniere_connexion) : "—"}</td>
+          <td><button class="btn small" data-uedit="${u.id}">Modifier</button></td></tr>`
+        )
+        .join("")}</tbody>
+    </table></div>
+    <div class="card">
+      <h2>Sauvegarde</h2>
+      <p class="muted">Télécharge une archive ZIP contenant la base de données et tous les documents joints. À conserver en lieu sûr (données personnelles).</p>
+      <a class="btn" href="/api/sauvegarde.zip">Télécharger une sauvegarde complète</a>
+    </div>`;
+
+  document.getElementById("uform").onsubmit = async (e) => {
+    e.preventDefault();
+    const data = Object.fromEntries(new FormData(e.target));
+    if (editId) data.actif = !!data.actif;
+    try {
+      if (editId) await api(`/utilisateurs/${editId}`, { method: "PUT", body: data });
+      else await api("/utilisateurs", { method: "POST", body: data });
+      toast(editId ? "Utilisateur modifié." : "Compte créé. Communiquez l'identifiant et le mot de passe provisoire à votre collègue.");
+      viewUsers();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+  document.getElementById("u-cancel")?.addEventListener("click", () => viewUsers());
+  $app.querySelectorAll("[data-uedit]").forEach((b) => b.addEventListener("click", () => viewUsers(Number(b.dataset.uedit))));
+}
+
+boot();
 
 /* ------------------------------------------------------------------ */
 /* Tableau de bord                                                     */
@@ -270,7 +465,7 @@ async function viewDetail(id) {
         <a class="btn" href="#/sinistres">← Liste</a>
         <button class="btn" id="print">Imprimer</button>
         <a class="btn primary" href="#/sinistres/${s.id}/modifier">Modifier</a>
-        <button class="btn danger" id="del">Supprimer</button>
+        ${isAdmin() ? '<button class="btn danger" id="del">Supprimer</button>' : ""}
       </div>
     </div>
     ${alerte ? `<div class="card" style="border-color:var(--warn);background:var(--warn-soft)"><strong class="hint warn" style="font-size:.95rem">⚠ ${esc(alerte)}</strong></div>` : ""}
@@ -316,7 +511,7 @@ async function viewDetail(id) {
         </div>
         ${renderDocs(s.documents)}
       </div>
-      <div class="card"><h2>Journal de suivi</h2>
+      <div class="card" id="journal-card"><h2>Journal de suivi</h2>
         <form id="jform" class="no-print" style="margin-bottom:1rem">
           <div class="form-grid">
             <div><label>Date</label><input type="date" name="date" value="${today()}"></div>
@@ -328,7 +523,7 @@ async function viewDetail(id) {
         <ul class="timeline">${
           s.journal
             .map(
-              (j) => `<li><div class="meta"><strong>${fmtDate(j.date)}</strong> · ${esc(j.type)}
+              (j) => `<li><div class="meta"><strong>${fmtDate(j.date)}</strong> · ${esc(j.type)}${j.auteur ? ` · ${esc(j.auteur)}` : ""}
             <button class="btn small no-print" data-jdel="${j.id}" title="Supprimer">✕</button></div>
             <div class="txt">${esc(j.commentaire)}</div></li>`
             )
@@ -339,7 +534,7 @@ async function viewDetail(id) {
 
   document.getElementById("print").onclick = () => window.print();
   bindDocs(s, () => viewDetail(id));
-  document.getElementById("del").onclick = async () => {
+  if (isAdmin()) document.getElementById("del").onclick = async () => {
     if (!confirm(`Supprimer définitivement le dossier ${s.reference} et son journal ?`)) return;
     await api(`/sinistres/${s.id}`, { method: "DELETE" });
     toast("Dossier supprimé.");
@@ -393,7 +588,7 @@ function renderDocs(docs) {
             ${isImage(d) ? `<img src="/api/documents/${d.id}" alt="" loading="lazy">` : `<span>${esc(docIcon(d))}</span>`}
           </a>
           <div class="doc-name" title="${esc(d.nom)}">${esc(d.nom)}</div>
-          <div class="doc-meta">${fmtDate(d.created_at)} · ${fmtSize(d.taille)}</div>
+          <div class="doc-meta">${fmtDate(d.created_at)} · ${fmtSize(d.taille)}${d.auteur ? `<br>${esc(d.auteur)}` : ""}</div>
           <div class="doc-actions no-print">
             <a class="btn small" href="/api/documents/${d.id}?download=1" title="Télécharger">⬇</a>
             <select class="doc-recat" data-id="${d.id}" title="Changer de catégorie">${META.doc_categories
@@ -616,7 +811,7 @@ async function viewCopros(editId = null) {
             (c) => `<tr><td><strong>${esc(c.nom)}</strong></td><td>${esc(c.adresse)}</td><td>${esc(c.assureur)}</td>
           <td>${esc(c.numero_police)}</td><td class="num">${c.nb_ouverts}</td><td class="num">${c.nb_sinistres}</td>
           <td class="actions"><button class="btn small" data-edit="${c.id}">Modifier</button>
-          <button class="btn small danger" data-del="${c.id}">Supprimer</button></td></tr>`
+          ${isAdmin() ? `<button class="btn small danger" data-del="${c.id}">Supprimer</button>` : ""}</td></tr>`
           )
           .join("") || '<tr><td colspan="7" class="muted">Aucune copropriété.</td></tr>'
       }</tbody>

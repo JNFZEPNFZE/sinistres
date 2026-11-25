@@ -1,3 +1,5 @@
+import http.cookiejar
+import io
 import json
 import os
 import sys
@@ -23,6 +25,15 @@ class ApiTest(unittest.TestCase):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
         cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.opener = cls.new_opener()
+        st, _ = cls.call(cls, "POST", "/api/installation", {
+            "identifiant": "admin", "nom": "Admin Test", "mot_de_passe": "motdepasse-admin"})
+        assert st == 201, st
+
+    @staticmethod
+    def new_opener():
+        return urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
     @classmethod
     def tearDownClass(cls):
@@ -30,13 +41,13 @@ class ApiTest(unittest.TestCase):
         cls.server.server_close()
         cls.tmp.cleanup()
 
-    def call(self, method, path, body=None, raw=None, headers=None):
+    def call(self, method, path, body=None, raw=None, headers=None, opener=None):
         data = json.dumps(body).encode() if body is not None else raw
         hdrs = {"Content-Type": "application/json", "X-Requested-With": "fetch"}
         hdrs.update(headers or {})
         req = urllib.request.Request(self.base + path, data=data, method=method, headers=hdrs)
         try:
-            with urllib.request.urlopen(req) as r:
+            with (opener or self.opener).open(req) as r:
                 content = r.read()
                 self.last_headers = r.headers
                 ctype = r.headers.get("Content-Type", "")
@@ -114,14 +125,15 @@ class ApiTest(unittest.TestCase):
             "localisation": "Bât. A, 3e étage", "date_echeance": "2000-01-01",
         })
         self.assertEqual(st, 201)
-        self.assertRegex(s["reference"], r"^SIN-\d{4}-0001$")
+        self.assertRegex(s["reference"], r"^SIN-\d{4}-\d{4}$")
+        num = int(s["reference"][-4:])
         self.assertEqual(s["montant_estime"], 1250.5)
         self.assertEqual(s["copropriete_nom"], "Résidence Les Tilleuls")
         self.assertEqual(len(s["journal"]), 1)
         sid = s["id"]
 
         st, s2 = self.call("POST", "/api/sinistres", {"type": "Incendie", "statut": "À déclarer"})
-        self.assertTrue(s2["reference"].endswith("0002"))
+        self.assertEqual(int(s2["reference"][-4:]), num + 1)
 
         payload = dict(s, statut="Clôturé", montant_indemnise=1100)
         st, upd = self.call("PUT", f"/api/sinistres/{sid}", payload)
@@ -136,9 +148,8 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(len(upd["journal"]), 3)
 
         st, stats = self.call("GET", "/api/stats")
-        self.assertEqual(stats["total"], 2)
-        self.assertEqual(stats["ouverts"], 1)
-        self.assertEqual(stats["montant_indemnise_total"], 1100)
+        self.assertGreaterEqual(stats["total"], 2)
+        self.assertGreaterEqual(stats["montant_indemnise_total"], 1100)
 
         st, csv_bytes = self.call("GET", "/api/export.csv")
         text = csv_bytes.decode("utf-8-sig")
@@ -164,6 +175,104 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(st, 400)
         st, err = self.call("POST", "/api/coproprietes", {"nom": "  "})
         self.assertEqual(st, 400)
+
+    def test_authentification(self):
+        anonyme = self.new_opener()
+        st, err = self.call("GET", "/api/sinistres", opener=anonyme)
+        self.assertEqual(st, 401)
+        self.assertTrue(err["auth"])
+        st, ses = self.call("GET", "/api/session", opener=anonyme)
+        self.assertEqual(ses, {"utilisateur": None, "installation": False})
+        # Une seconde installation est refusée
+        st, _ = self.call("POST", "/api/installation", {
+            "identifiant": "pirate", "nom": "X", "mot_de_passe": "12345678"}, opener=anonyme)
+        self.assertEqual(st, 403)
+        # Protection CSRF : sans l'en-tête X-Requested-With, refus
+        st, _ = self.call("POST", "/api/coproprietes", {"nom": "X"},
+                          headers={"X-Requested-With": ""})
+        self.assertEqual(st, 403)
+
+        # Création d'un gestionnaire par l'admin
+        st, _ = self.call("POST", "/api/utilisateurs", {
+            "identifiant": "Marie", "nom": "Marie Martin", "role": "gestionnaire",
+            "mot_de_passe": "court"})
+        self.assertEqual(st, 400)
+        st, u = self.call("POST", "/api/utilisateurs", {
+            "identifiant": "Marie", "nom": "Marie Martin", "role": "gestionnaire",
+            "mot_de_passe": "secret-marie"})
+        self.assertEqual(st, 201)
+        st, _ = self.call("POST", "/api/utilisateurs", {
+            "identifiant": "marie", "nom": "Doublon", "mot_de_passe": "secret-marie"})
+        self.assertEqual(st, 400)
+
+        marie = self.new_opener()
+        st, _ = self.call("POST", "/api/connexion",
+                          {"identifiant": "marie", "mot_de_passe": "mauvais"}, opener=marie)
+        self.assertEqual(st, 401)
+        st, ses = self.call("POST", "/api/connexion",
+                            {"identifiant": "MARIE", "mot_de_passe": "secret-marie"}, opener=marie)
+        self.assertEqual(st, 200)
+        self.assertEqual(ses["utilisateur"]["role"], "gestionnaire")
+
+        # Le journal enregistre l'auteur
+        st, s = self.call("POST", "/api/sinistres", {"type": "Incendie", "statut": "Déclaré"},
+                          opener=marie)
+        self.assertEqual(s["journal"][0]["auteur"], "Marie Martin")
+        # Droits : un gestionnaire ne peut ni supprimer un dossier ni gérer les comptes
+        st, _ = self.call("DELETE", f"/api/sinistres/{s['id']}", opener=marie)
+        self.assertEqual(st, 403)
+        st, _ = self.call("POST", "/api/utilisateurs", {"identifiant": "x"}, opener=marie)
+        self.assertEqual(st, 403)
+        st, _ = self.call("GET", "/api/sauvegarde.zip", opener=marie)
+        self.assertEqual(st, 403)
+
+        # Changement de mot de passe : l'ancien est exigé
+        st, _ = self.call("PUT", "/api/moi", {"nom": "Marie M.", "ancien_mot_de_passe": "faux",
+                                              "nouveau_mot_de_passe": "nouveau-secret"}, opener=marie)
+        self.assertEqual(st, 400)
+        st, _ = self.call("PUT", "/api/moi", {"nom": "Marie M.", "ancien_mot_de_passe": "secret-marie",
+                                              "nouveau_mot_de_passe": "nouveau-secret"}, opener=marie)
+        self.assertEqual(st, 200)
+
+        # Désactivation : la session est coupée immédiatement
+        st, _ = self.call("PUT", f"/api/utilisateurs/{u['id']}",
+                          {"nom": "Marie M.", "role": "gestionnaire", "actif": False})
+        self.assertEqual(st, 200)
+        st, _ = self.call("GET", "/api/sinistres", opener=marie)
+        self.assertEqual(st, 401)
+
+        # Le dernier administrateur ne peut pas être rétrogradé
+        st, users = self.call("GET", "/api/utilisateurs")
+        admin = next(x for x in users if x["identifiant"] == "admin")
+        self.assertNotIn("mot_de_passe", admin)
+        st, err = self.call("PUT", f"/api/utilisateurs/{admin['id']}",
+                            {"nom": "Admin", "role": "gestionnaire", "actif": True})
+        self.assertEqual(st, 400)
+
+        st, _ = self.call("POST", "/api/deconnexion", opener=marie)
+        self.assertEqual(st, 401)
+
+    def test_limitation_tentatives(self):
+        o = self.new_opener()
+        for _ in range(8):
+            st, _ = self.call("POST", "/api/connexion",
+                              {"identifiant": "admin", "mot_de_passe": "x"}, opener=o)
+            self.assertEqual(st, 401)
+        st, _ = self.call("POST", "/api/connexion",
+                          {"identifiant": "admin", "mot_de_passe": "motdepasse-admin"}, opener=o)
+        self.assertEqual(st, 429)
+        app.THROTTLE.fails.clear()
+
+    def test_sauvegarde(self):
+        import zipfile
+        st, s = self.call("POST", "/api/sinistres", {"type": "Autre", "statut": "Déclaré"})
+        self.upload(s["id"], "devis.pdf", b"%PDF-1.4", "application/pdf", "Devis")
+        st, body = self.call("GET", "/api/sauvegarde.zip")
+        self.assertEqual(st, 200)
+        z = zipfile.ZipFile(io.BytesIO(body))
+        names = z.namelist()
+        self.assertIn("sinistres.db", names)
+        self.assertTrue(any(n.startswith(f"documents/{s['id']}/") for n in names))
 
     def test_page_accueil(self):
         with urllib.request.urlopen(self.base + "/") as r:

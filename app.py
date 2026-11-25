@@ -5,6 +5,8 @@ Serveur web sans dépendance externe (bibliothèque standard Python + SQLite).
 Lancement : python3 app.py  puis ouvrir http://localhost:8000
 """
 import csv
+import hashlib
+import hmac
 import io
 import json
 import mimetypes
@@ -14,7 +16,11 @@ import secrets
 import shutil
 import sqlite3
 import sys
-from datetime import date, datetime
+import tempfile
+import threading
+import time
+import zipfile
+from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -24,6 +30,12 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 DB_PATH = os.environ.get("SINISTRES_DB", os.path.join(BASE_DIR, "sinistres.db"))
 DOCS_DIR = os.environ.get("SINISTRES_DOCS", os.path.join(BASE_DIR, "documents"))
 MAX_UPLOAD = int(os.environ.get("SINISTRES_MAX_UPLOAD_MO", 25)) * 1024 * 1024
+SESSION_HOURS = int(os.environ.get("SINISTRES_SESSION_HEURES", 12))
+# À activer quand l'application est servie en HTTPS (derrière Caddy, Nginx…)
+COOKIE_SECURE = os.environ.get("SINISTRES_COOKIE_SECURE") == "1"
+# À activer derrière un proxy inverse pour lire l'adresse IP réelle du client
+TRUST_PROXY = os.environ.get("SINISTRES_TRUST_PROXY") == "1"
+ROLES = ["admin", "gestionnaire"]
 
 TYPES = [
     "Dégât des eaux",
@@ -131,6 +143,28 @@ MIGRATIONS = [
     );
     CREATE INDEX idx_documents_sinistre ON documents(sinistre_id);
     """,
+    # v3 — comptes utilisateurs et sessions
+    """
+    CREATE TABLE utilisateurs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        identifiant TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        nom TEXT NOT NULL,
+        email TEXT DEFAULT '',
+        role TEXT NOT NULL DEFAULT 'gestionnaire',
+        mot_de_passe TEXT NOT NULL,
+        actif INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        derniere_connexion TEXT DEFAULT ''
+    );
+    CREATE TABLE sessions (
+        token_hash TEXT PRIMARY KEY,
+        utilisateur_id INTEGER NOT NULL REFERENCES utilisateurs(id) ON DELETE CASCADE,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    ALTER TABLE journal ADD COLUMN auteur_id INTEGER REFERENCES utilisateurs(id);
+    ALTER TABLE documents ADD COLUMN auteur_id INTEGER REFERENCES utilisateurs(id);
+    """,
 ]
 
 COPRO_FIELDS = ["nom", "adresse", "assureur", "numero_police", "courtier", "notes"]
@@ -163,7 +197,7 @@ def now_iso():
 
 
 def connect(path=None):
-    conn = sqlite3.connect(path or DB_PATH)
+    conn = sqlite3.connect(path or DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -172,6 +206,7 @@ def connect(path=None):
 def init_db(path=None):
     conn = connect(path)
     try:
+        conn.execute("PRAGMA journal_mode = WAL")  # lectures et écritures simultanées
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         for i, sql in enumerate(MIGRATIONS[version:], start=version + 1):
             conn.executescript(sql)
@@ -232,6 +267,127 @@ def clean_sinistre(data):
 
 
 # --------------------------------------------------------------------------- #
+# Comptes et sessions
+# --------------------------------------------------------------------------- #
+SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1}
+
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    h = hashlib.scrypt(password.encode(), salt=salt, dklen=32, **SCRYPT)
+    return f"scrypt${SCRYPT['n']}${SCRYPT['r']}${SCRYPT['p']}${salt.hex()}${h.hex()}"
+
+
+def verify_password(password, stored):
+    try:
+        _, n, r, p, salt, h = stored.split("$")
+        calc = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), dklen=32,
+                              n=int(n), r=int(r), p=int(p))
+        return hmac.compare_digest(calc.hex(), h)
+    except (ValueError, TypeError):
+        return False
+
+
+DUMMY_HASH = hash_password(secrets.token_hex(8))
+
+
+def check_password_strength(pw):
+    if len(pw or "") < 8:
+        raise ApiError("Le mot de passe doit contenir au moins 8 caractères.")
+
+
+def token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def create_session(conn, uid):
+    token = secrets.token_urlsafe(32)
+    expires = (datetime.now() + timedelta(hours=SESSION_HOURS)).isoformat(timespec="seconds")
+    conn.execute("DELETE FROM sessions WHERE expires_at < ?", (now_iso(),))
+    conn.execute("INSERT INTO sessions (token_hash, utilisateur_id, expires_at, created_at) "
+                 "VALUES (?,?,?,?)", (token_hash(token), uid, expires, now_iso()))
+    conn.execute("UPDATE utilisateurs SET derniere_connexion = ? WHERE id = ?", (now_iso(), uid))
+    return token
+
+
+def session_user(conn, token):
+    if not token:
+        return None
+    row = conn.execute("""
+        SELECT u.id, u.identifiant, u.nom, u.email, u.role, s.expires_at
+        FROM sessions s JOIN utilisateurs u ON u.id = s.utilisateur_id
+        WHERE s.token_hash = ? AND u.actif = 1""", (token_hash(token),)).fetchone()
+    if not row or row["expires_at"] < now_iso():
+        return None
+    # Expiration glissante : la session est prolongée à chaque utilisation
+    expires = (datetime.now() + timedelta(hours=SESSION_HOURS)).isoformat(timespec="seconds")
+    conn.execute("UPDATE sessions SET expires_at = ? WHERE token_hash = ?",
+                 (expires, token_hash(token)))
+    u = dict(row)
+    del u["expires_at"]
+    return u
+
+
+def session_cookie(token, max_age):
+    parts = [f"sid={token}", "Path=/", "HttpOnly", "SameSite=Strict", f"Max-Age={max_age}"]
+    if COOKIE_SECURE:
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+class LoginThrottle:
+    """Limite les tentatives de connexion échouées (8 par quart d'heure)."""
+
+    def __init__(self, limit=8, window=900):
+        self.limit, self.window, self.fails, self.lock = limit, window, {}, threading.Lock()
+
+    def _recent(self, key):
+        now = time.monotonic()
+        self.fails[key] = [t for t in self.fails.get(key, []) if now - t < self.window]
+        return self.fails[key]
+
+    def blocked(self, key):
+        with self.lock:
+            return len(self._recent(key)) >= self.limit
+
+    def fail(self, key):
+        with self.lock:
+            self._recent(key).append(time.monotonic())
+
+    def reset(self, key):
+        with self.lock:
+            self.fails.pop(key, None)
+
+
+THROTTLE = LoginThrottle()
+
+USER_PUBLIC = "id, identifiant, nom, email, role, actif, created_at, derniere_connexion"
+
+
+def clean_user(data, creating):
+    out = {
+        "nom": str(data.get("nom") or "").strip(),
+        "email": str(data.get("email") or "").strip(),
+        "role": data.get("role") or "gestionnaire",
+    }
+    if not out["nom"]:
+        raise ApiError("Le nom est obligatoire.")
+    if out["role"] not in ROLES:
+        raise ApiError("Rôle invalide.")
+    if creating:
+        ident = str(data.get("identifiant") or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9._@-]{3,60}", ident):
+            raise ApiError("Identifiant invalide (3 à 60 caractères : lettres, chiffres, . _ - @).")
+        out["identifiant"] = ident
+    return out
+
+
+def count_admins(conn, exclude=None):
+    return conn.execute("SELECT COUNT(*) FROM utilisateurs WHERE role = 'admin' AND actif = 1 "
+                        "AND id != ?", (exclude or 0,)).fetchone()[0]
+
+
+# --------------------------------------------------------------------------- #
 # Accès aux données
 # --------------------------------------------------------------------------- #
 def next_reference(conn):
@@ -273,10 +429,12 @@ def get_sinistre(conn, sid):
         raise NotFound("Sinistre introuvable.")
     s = dict(row)
     s["journal"] = [dict(r) for r in conn.execute(
-        "SELECT * FROM journal WHERE sinistre_id = ? ORDER BY date DESC, id DESC", (sid,))]
+        "SELECT j.*, u.nom AS auteur FROM journal j LEFT JOIN utilisateurs u ON u.id = j.auteur_id "
+        "WHERE j.sinistre_id = ? ORDER BY j.date DESC, j.id DESC", (sid,))]
     s["documents"] = [dict(r) for r in conn.execute(
-        "SELECT id, nom, categorie, mime, taille, created_at FROM documents "
-        "WHERE sinistre_id = ? ORDER BY created_at DESC, id DESC", (sid,))]
+        "SELECT d.id, d.nom, d.categorie, d.mime, d.taille, d.created_at, u.nom AS auteur "
+        "FROM documents d LEFT JOIN utilisateurs u ON u.id = d.auteur_id "
+        "WHERE d.sinistre_id = ? ORDER BY d.created_at DESC, d.id DESC", (sid,))]
     return s
 
 
@@ -285,14 +443,15 @@ def require_sinistre(conn, sid):
         raise NotFound("Sinistre introuvable.")
 
 
-def add_journal(conn, sid, jtype, commentaire, jdate=None):
+def add_journal(conn, sid, jtype, commentaire, jdate=None, auteur_id=None):
     conn.execute(
-        "INSERT INTO journal (sinistre_id, date, type, commentaire, created_at) VALUES (?,?,?,?,?)",
-        (sid, jdate or date.today().isoformat(), jtype, commentaire, now_iso()),
+        "INSERT INTO journal (sinistre_id, date, type, commentaire, created_at, auteur_id) "
+        "VALUES (?,?,?,?,?,?)",
+        (sid, jdate or date.today().isoformat(), jtype, commentaire, now_iso(), auteur_id),
     )
 
 
-def create_sinistre(conn, data):
+def create_sinistre(conn, data, user=None):
     s = clean_sinistre(data)
     s["reference"] = next_reference(conn)
     s["created_at"] = s["updated_at"] = now_iso()
@@ -302,11 +461,12 @@ def create_sinistre(conn, data):
         [s[c] for c in cols],
     )
     sid = cur.lastrowid
-    add_journal(conn, sid, "Changement de statut", f"Dossier créé — statut : {s['statut']}")
+    add_journal(conn, sid, "Changement de statut", f"Dossier créé — statut : {s['statut']}",
+                auteur_id=user and user["id"])
     return sid
 
 
-def update_sinistre(conn, sid, data):
+def update_sinistre(conn, sid, data, user=None):
     old = conn.execute("SELECT statut, date_cloture FROM sinistres WHERE id = ?", (sid,)).fetchone()
     if not old:
         raise NotFound("Sinistre introuvable.")
@@ -317,7 +477,8 @@ def update_sinistre(conn, sid, data):
     conn.execute(f"UPDATE sinistres SET {', '.join(c + ' = ?' for c in s)} WHERE id = ?",
                  [*s.values(), sid])
     if old["statut"] != s["statut"]:
-        add_journal(conn, sid, "Changement de statut", f"{old['statut']} → {s['statut']}")
+        add_journal(conn, sid, "Changement de statut", f"{old['statut']} → {s['statut']}",
+                    auteur_id=user and user["id"])
 
 
 def delete_sinistre_files(conn, sid):
@@ -394,9 +555,9 @@ def export_csv(conn):
 ROUTES = []
 
 
-def route(method, pattern):
+def route(method, pattern, public=False, admin=False):
     def deco(fn):
-        ROUTES.append((method, re.compile(f"^{pattern}$"), fn))
+        ROUTES.append((method, re.compile(f"^{pattern}$"), fn, public, admin))
         return fn
     return deco
 
@@ -404,13 +565,26 @@ def route(method, pattern):
 class Raw:
     """Réponse non-JSON (fichier, CSV…)."""
 
-    def __init__(self, body=None, ctype="application/octet-stream", headers=None, path=None):
+    def __init__(self, body=None, ctype="application/octet-stream", headers=None, path=None,
+                 cleanup=None):
         self.body, self.ctype, self.headers, self.path = body, ctype, headers or {}, path
+        self.cleanup = cleanup  # dossier temporaire à supprimer après l'envoi
 
 
 class Ctx:
     def __init__(self, handler, conn, query):
         self.h, self.conn, self.query = handler, conn, query
+        self.user = None
+        self.headers = []  # en-têtes supplémentaires (Set-Cookie…)
+
+    @property
+    def uid(self):
+        return self.user["id"] if self.user else None
+
+    def client_ip(self):
+        if TRUST_PROXY and self.h.headers.get("X-Forwarded-For"):
+            return self.h.headers["X-Forwarded-For"].split(",")[0].strip()
+        return self.h.client_address[0]
 
     def json(self):
         length = int(self.h.headers.get("Content-Length") or 0)
@@ -425,6 +599,149 @@ class Ctx:
         if not isinstance(data, dict):
             raise ApiError("Requête JSON invalide.")
         return data
+
+
+# -- Authentification --
+def user_count(conn):
+    return conn.execute("SELECT COUNT(*) FROM utilisateurs").fetchone()[0]
+
+
+@route("GET", "/api/session", public=True)
+def api_session(ctx):
+    user = session_user(ctx.conn, ctx.h.cookie("sid"))
+    return {"utilisateur": user, "installation": user_count(ctx.conn) == 0}
+
+
+@route("POST", "/api/installation", public=True)
+def api_setup(ctx):
+    """Création du premier compte administrateur (uniquement si aucun compte n'existe)."""
+    if user_count(ctx.conn):
+        raise ApiError("L'application est déjà configurée.", HTTPStatus.FORBIDDEN)
+    data = ctx.json()
+    u = clean_user({**data, "role": "admin"}, creating=True)
+    check_password_strength(data.get("mot_de_passe"))
+    cur = ctx.conn.execute(
+        "INSERT INTO utilisateurs (identifiant, nom, email, role, mot_de_passe, created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (u["identifiant"], u["nom"], u["email"], "admin", hash_password(data["mot_de_passe"]),
+         now_iso()))
+    token = create_session(ctx.conn, cur.lastrowid)
+    ctx.headers.append(("Set-Cookie", session_cookie(token, SESSION_HOURS * 3600)))
+    return {"utilisateur": session_user(ctx.conn, token)}, HTTPStatus.CREATED
+
+
+@route("POST", "/api/connexion", public=True)
+def api_login(ctx):
+    data = ctx.json()
+    ident = str(data.get("identifiant") or "").strip().lower()
+    key = (ctx.client_ip(), ident)
+    if THROTTLE.blocked(key):
+        raise ApiError("Trop de tentatives. Réessayez dans un quart d'heure.",
+                       HTTPStatus.TOO_MANY_REQUESTS)
+    row = ctx.conn.execute("SELECT id, mot_de_passe, actif FROM utilisateurs WHERE identifiant = ?",
+                           (ident,)).fetchone()
+    ok = verify_password(str(data.get("mot_de_passe") or ""),
+                         row["mot_de_passe"] if row else DUMMY_HASH)
+    if not (row and ok and row["actif"]):
+        THROTTLE.fail(key)
+        raise ApiError("Identifiant ou mot de passe incorrect.", HTTPStatus.UNAUTHORIZED)
+    THROTTLE.reset(key)
+    token = create_session(ctx.conn, row["id"])
+    ctx.headers.append(("Set-Cookie", session_cookie(token, SESSION_HOURS * 3600)))
+    return {"utilisateur": session_user(ctx.conn, token)}
+
+
+@route("POST", "/api/deconnexion")
+def api_logout(ctx):
+    ctx.conn.execute("DELETE FROM sessions WHERE token_hash = ?",
+                     (token_hash(ctx.h.cookie("sid") or ""),))
+    ctx.headers.append(("Set-Cookie", session_cookie("", 0)))
+    return {"ok": True}
+
+
+@route("PUT", "/api/moi")
+def api_me_update(ctx):
+    data = ctx.json()
+    nom = str(data.get("nom") or "").strip()
+    if not nom:
+        raise ApiError("Le nom est obligatoire.")
+    ctx.conn.execute("UPDATE utilisateurs SET nom = ?, email = ? WHERE id = ?",
+                     (nom, str(data.get("email") or "").strip(), ctx.uid))
+    if data.get("nouveau_mot_de_passe"):
+        stored = ctx.conn.execute("SELECT mot_de_passe FROM utilisateurs WHERE id = ?",
+                                  (ctx.uid,)).fetchone()[0]
+        if not verify_password(str(data.get("ancien_mot_de_passe") or ""), stored):
+            raise ApiError("Mot de passe actuel incorrect.")
+        check_password_strength(data["nouveau_mot_de_passe"])
+        ctx.conn.execute("UPDATE utilisateurs SET mot_de_passe = ? WHERE id = ?",
+                         (hash_password(data["nouveau_mot_de_passe"]), ctx.uid))
+        # Déconnecte les autres appareils
+        ctx.conn.execute("DELETE FROM sessions WHERE utilisateur_id = ? AND token_hash != ?",
+                         (ctx.uid, token_hash(ctx.h.cookie("sid"))))
+    return {"ok": True}
+
+
+# -- Utilisateurs --
+@route("GET", "/api/utilisateurs")
+def api_users(ctx):
+    return [dict(r) for r in ctx.conn.execute(
+        f"SELECT {USER_PUBLIC} FROM utilisateurs ORDER BY actif DESC, nom COLLATE NOCASE")]
+
+
+@route("POST", "/api/utilisateurs", admin=True)
+def api_user_create(ctx):
+    data = ctx.json()
+    u = clean_user(data, creating=True)
+    check_password_strength(data.get("mot_de_passe"))
+    try:
+        cur = ctx.conn.execute(
+            "INSERT INTO utilisateurs (identifiant, nom, email, role, mot_de_passe, created_at) "
+            "VALUES (?,?,?,?,?,?)", (u["identifiant"], u["nom"], u["email"], u["role"],
+                                     hash_password(data["mot_de_passe"]), now_iso()))
+    except sqlite3.IntegrityError:
+        raise ApiError("Cet identifiant est déjà utilisé.")
+    return {"id": cur.lastrowid}, HTTPStatus.CREATED
+
+
+@route("PUT", r"/api/utilisateurs/(\d+)", admin=True)
+def api_user_update(ctx, uid):
+    if not ctx.conn.execute("SELECT 1 FROM utilisateurs WHERE id = ?", (uid,)).fetchone():
+        raise NotFound("Utilisateur introuvable.")
+    data = ctx.json()
+    u = clean_user(data, creating=False)
+    actif = 1 if data.get("actif", True) else 0
+    if (u["role"] != "admin" or not actif) and not count_admins(ctx.conn, exclude=uid):
+        raise ApiError("Il doit rester au moins un administrateur actif.")
+    ctx.conn.execute("UPDATE utilisateurs SET nom = ?, email = ?, role = ?, actif = ? WHERE id = ?",
+                     (u["nom"], u["email"], u["role"], actif, uid))
+    if data.get("mot_de_passe"):
+        check_password_strength(data["mot_de_passe"])
+        ctx.conn.execute("UPDATE utilisateurs SET mot_de_passe = ? WHERE id = ?",
+                         (hash_password(data["mot_de_passe"]), uid))
+    if data.get("mot_de_passe") or not actif:
+        ctx.conn.execute("DELETE FROM sessions WHERE utilisateur_id = ?", (uid,))
+    return {"ok": True}
+
+
+# -- Sauvegarde complète (base + documents) --
+@route("GET", "/api/sauvegarde.zip", admin=True)
+def api_backup(ctx):
+    tmpdir = tempfile.mkdtemp(prefix="sinistres-")
+    db_copy = os.path.join(tmpdir, "sinistres.db")
+    ctx.conn.commit()  # la copie attendrait sinon la fin de la transaction en cours
+    dest = sqlite3.connect(db_copy)
+    ctx.conn.backup(dest)
+    dest.close()
+    zpath = os.path.join(tmpdir, "sauvegarde.zip")
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(db_copy, "sinistres.db")
+        for root, _, files in os.walk(DOCS_DIR):
+            for f in files:
+                full = os.path.join(root, f)
+                z.write(full, os.path.join("documents", os.path.relpath(full, DOCS_DIR)))
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    return Raw(path=zpath, ctype="application/zip", cleanup=tmpdir, headers={
+        "Content-Disposition": f'attachment; filename="sauvegarde-sinistres-{stamp}.zip"'})
 
 
 @route("GET", "/api/meta")
@@ -470,7 +787,7 @@ def api_copro_update(ctx, cid):
     return {"ok": True}
 
 
-@route("DELETE", r"/api/coproprietes/(\d+)")
+@route("DELETE", r"/api/coproprietes/(\d+)", admin=True)
 def api_copro_delete(ctx, cid):
     if not ctx.conn.execute("DELETE FROM coproprietes WHERE id = ?", (cid,)).rowcount:
         raise NotFound()
@@ -485,7 +802,7 @@ def api_sinistres(ctx):
 
 @route("POST", "/api/sinistres")
 def api_sinistre_create(ctx):
-    sid = create_sinistre(ctx.conn, ctx.json())
+    sid = create_sinistre(ctx.conn, ctx.json(), ctx.user)
     return get_sinistre(ctx.conn, sid), HTTPStatus.CREATED
 
 
@@ -496,11 +813,11 @@ def api_sinistre(ctx, sid):
 
 @route("PUT", r"/api/sinistres/(\d+)")
 def api_sinistre_update(ctx, sid):
-    update_sinistre(ctx.conn, sid, ctx.json())
+    update_sinistre(ctx.conn, sid, ctx.json(), ctx.user)
     return get_sinistre(ctx.conn, sid)
 
 
-@route("DELETE", r"/api/sinistres/(\d+)")
+@route("DELETE", r"/api/sinistres/(\d+)", admin=True)
 def api_sinistre_delete(ctx, sid):
     if not ctx.conn.execute("DELETE FROM sinistres WHERE id = ?", (sid,)).rowcount:
         raise NotFound()
@@ -519,7 +836,8 @@ def api_journal_add(ctx, sid):
         raise ApiError("Le commentaire est obligatoire.")
     if jtype not in JOURNAL_TYPES:
         raise ApiError("Type d'entrée invalide.")
-    add_journal(ctx.conn, sid, jtype, commentaire, check_date(d.get("date"), "date") or None)
+    add_journal(ctx.conn, sid, jtype, commentaire, check_date(d.get("date"), "date") or None,
+                ctx.uid)
     ctx.conn.execute("UPDATE sinistres SET updated_at = ? WHERE id = ?", (now_iso(), sid))
     return get_sinistre(ctx.conn, sid), HTTPStatus.CREATED
 
@@ -571,9 +889,11 @@ def api_document_upload(ctx, sid):
                 f.write(chunk)
                 remaining -= len(chunk)
         cur = ctx.conn.execute(
-            "INSERT INTO documents (sinistre_id, nom, categorie, mime, taille, fichier, created_at) "
-            "VALUES (?,?,?,?,?,?,?)", (sid, nom, categorie, mime, length, fichier, now_iso()))
-        add_journal(ctx.conn, sid, "Document", f"Document ajouté ({categorie}) : {nom}")
+            "INSERT INTO documents (sinistre_id, nom, categorie, mime, taille, fichier, created_at, "
+            "auteur_id) VALUES (?,?,?,?,?,?,?,?)",
+            (sid, nom, categorie, mime, length, fichier, now_iso(), ctx.uid))
+        add_journal(ctx.conn, sid, "Document", f"Document ajouté ({categorie}) : {nom}",
+                    auteur_id=ctx.uid)
     except Exception:
         if os.path.exists(path):
             os.remove(path)
@@ -618,7 +938,8 @@ def api_document_update(ctx, did):
 def api_document_delete(ctx, did):
     d = get_document(ctx.conn, did)
     ctx.conn.execute("DELETE FROM documents WHERE id = ?", (did,))
-    add_journal(ctx.conn, d["sinistre_id"], "Document", f"Document supprimé : {d['nom']}")
+    add_journal(ctx.conn, d["sinistre_id"], "Document", f"Document supprimé : {d['nom']}",
+                auteur_id=ctx.uid)
     try:
         os.remove(os.path.join(DOCS_DIR, d["fichier"]))
     except FileNotFoundError:
@@ -652,12 +973,21 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header(k, v)
         super().end_headers()
 
-    def send_json(self, payload, status=HTTPStatus.OK):
+    def cookie(self, name):
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == name:
+                return v
+        return None
+
+    def send_json(self, payload, status=HTTPStatus.OK, headers=()):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for k, v in headers:
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -670,11 +1000,15 @@ class Handler(SimpleHTTPRequestHandler):
         for k, v in raw.headers.items():
             self.send_header(k, v)
         self.end_headers()
-        if raw.path:
-            with open(raw.path, "rb") as f:
-                shutil.copyfileobj(f, self.wfile)
-        else:
-            self.wfile.write(raw.body)
+        try:
+            if raw.path:
+                with open(raw.path, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile)
+            else:
+                self.wfile.write(raw.body)
+        finally:
+            if raw.cleanup:
+                shutil.rmtree(raw.cleanup, ignore_errors=True)
 
     def dispatch(self, method):
         url = urlparse(self.path)
@@ -684,22 +1018,36 @@ class Handler(SimpleHTTPRequestHandler):
                 return super().do_GET()
             return self.send_json({"erreur": "Introuvable"}, HTTPStatus.NOT_FOUND)
 
-        for m, regex, fn in ROUTES:
+        for m, regex, fn, public, admin in ROUTES:
             match = regex.match(path)
             if match and m == method:
                 break
         else:
             return self.send_json({"erreur": "Introuvable"}, HTTPStatus.NOT_FOUND)
 
+        # Protection CSRF : les navigateurs n'ajoutent pas cet en-tête lors d'une requête
+        # provenant d'un autre site (sans autorisation CORS, que ce serveur ne donne jamais).
+        if method != "GET" and self.headers.get("X-Requested-With") != "fetch":
+            self.close_connection = True
+            return self.send_json({"erreur": "Requête refusée."}, HTTPStatus.FORBIDDEN)
+
         conn = connect()
+        ctx = Ctx(self, conn, parse_qs(url.query))
         try:
-            ctx = Ctx(self, conn, parse_qs(url.query))
+            if not public:
+                ctx.user = session_user(conn, self.cookie("sid"))
+                if not ctx.user:
+                    raise ApiError("Session expirée : veuillez vous reconnecter.",
+                                   HTTPStatus.UNAUTHORIZED)
+                if admin and ctx.user["role"] != "admin":
+                    raise ApiError("Action réservée aux administrateurs.", HTTPStatus.FORBIDDEN)
             result = fn(ctx, *(int(g) for g in match.groups()))
             conn.commit()
         except ApiError as e:
             conn.rollback()
             self.close_connection = True
-            return self.send_json({"erreur": str(e)}, e.status)
+            extra = {"auth": True} if e.status == HTTPStatus.UNAUTHORIZED else {}
+            return self.send_json({"erreur": str(e), **extra}, e.status)
         except Exception as e:  # pragma: no cover
             conn.rollback()
             self.log_error("Erreur : %r", e)
@@ -713,7 +1061,7 @@ class Handler(SimpleHTTPRequestHandler):
         status = HTTPStatus.OK
         if isinstance(result, tuple):
             result, status = result
-        self.send_json(result, status)
+        self.send_json(result, status, ctx.headers)
 
     def do_GET(self):
         self.dispatch("GET")
@@ -734,6 +1082,8 @@ def main():
     init_db()
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Suivi des sinistres : http://localhost:{port}  (Ctrl+C pour arrêter)")
+    if host not in ("127.0.0.1", "localhost"):
+        print(f"Accessible depuis le réseau sur le port {port} (adresse d'écoute : {host}).")
     print(f"Base de données : {DB_PATH}")
     print(f"Documents       : {DOCS_DIR}")
     try:

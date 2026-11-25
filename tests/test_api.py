@@ -288,6 +288,54 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(next(x for x in lst if x["id"] == c["id"])["assureur_adresse"],
                          "1 rue X, Paris")
 
+    def test_champs_personnalises_et_gestionnaire(self):
+        st, defs = self.call("PUT", "/api/champs", {"champs": [
+            {"libelle": "Réf. syndic interne", "type": "texte"},
+            {"libelle": "Urgence", "type": "liste", "options": "Faible, Moyenne,Haute"},
+            {"libelle": "Copropriétaire informé", "type": "oui_non"},
+            {"libelle": "Surface touchée (m²)", "type": "nombre"},
+        ]})
+        self.assertEqual(st, 200, defs)
+        self.assertEqual(defs[0]["cle"], "ref_syndic_interne")
+        self.assertEqual(defs[1]["options"], ["Faible", "Moyenne", "Haute"])
+        st, err = self.call("PUT", "/api/champs", {"champs": [{"libelle": "X", "type": "liste"}]})
+        self.assertEqual(st, 400)
+
+        st, s = self.call("POST", "/api/sinistres", {
+            "type": "Dégât des eaux", "statut": "Déclaré", "numero_lot": "24",
+            "champs_perso": {"ref_syndic_interne": "A-12", "urgence": "Haute",
+                             "coproprietaire_informe": True, "surface_touchee_m2": "3,5",
+                             "pirate": "ignoré"}})
+        self.assertEqual(st, 201, s)
+        self.assertEqual(s["numero_lot"], "24")
+        self.assertEqual(s["gestionnaire_nom"], "Admin Test")  # créateur par défaut
+        self.assertEqual(s["champs_perso"]["urgence"], "Haute")
+        self.assertEqual(s["champs_perso"]["surface_touchee_m2"], 3.5)
+        self.assertNotIn("pirate", s["champs_perso"])
+        self.assertIs(s["champs_perso"]["coproprietaire_informe"], True)
+
+        st, err = self.call("PUT", f"/api/sinistres/{s['id']}",
+                            dict(s, champs_perso={"urgence": "Inconnue"}))
+        self.assertEqual(st, 400)
+        st, err = self.call("PUT", f"/api/sinistres/{s['id']}", dict(s, gestionnaire_id=9999))
+        self.assertEqual(st, 400)
+
+        # Renommer un champ conserve sa clé (et donc les valeurs déjà saisies)
+        defs[1]["libelle"] = "Niveau d'urgence"
+        st, defs2 = self.call("PUT", "/api/champs", {"champs": defs})
+        self.assertEqual(defs2[1]["cle"], "urgence")
+
+        st, csv_bytes = self.call("GET", "/api/export.csv")
+        text = csv_bytes.decode("utf-8-sig")
+        self.assertIn("Niveau d'urgence", text.splitlines()[0])
+        self.assertIn("Haute", text)
+
+        st, stats = self.call("GET", f"/api/stats?gestionnaire={s['gestionnaire_id']}")
+        self.assertGreaterEqual(stats["total"], 1)
+        st, stats = self.call("GET", "/api/stats?gestionnaire=9999")
+        self.assertEqual(stats["total"], 0)
+        self.call("PUT", "/api/champs", {"champs": []})
+
     def test_page_accueil(self):
         with urllib.request.urlopen(self.base + "/") as r:
             self.assertIn(b"Suivi des sinistres", r.read())

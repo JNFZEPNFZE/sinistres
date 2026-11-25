@@ -171,6 +171,13 @@ MIGRATIONS = [
     ALTER TABLE coproprietes ADD COLUMN assureur_adresse TEXT DEFAULT '';
     ALTER TABLE coproprietes ADD COLUMN assureur_email TEXT DEFAULT '';
     """,
+    # v5 — gestionnaire du dossier, n° de lot, champs personnalisés
+    """
+    ALTER TABLE sinistres ADD COLUMN gestionnaire_id INTEGER REFERENCES utilisateurs(id);
+    ALTER TABLE sinistres ADD COLUMN numero_lot TEXT DEFAULT '';
+    ALTER TABLE sinistres ADD COLUMN champs_perso TEXT DEFAULT '{}';
+    CREATE INDEX idx_sinistres_gestionnaire ON sinistres(gestionnaire_id);
+    """,
 ]
 
 COPRO_FIELDS = ["nom", "adresse", "assureur", "assureur_adresse", "assureur_email",
@@ -183,8 +190,10 @@ SINISTRE_FIELDS = [
     "tiers", "description", "assureur", "numero_sinistre_assureur", "convention",
     "expert", "date_expertise", "entreprise", "montant_estime", "montant_devis",
     "franchise", "montant_indemnise", "date_indemnisation", "prochaine_action",
-    "date_echeance", "date_cloture",
+    "date_echeance", "date_cloture", "gestionnaire_id", "numero_lot",
 ]
+CHAMP_TYPES = {"texte": "Texte", "nombre": "Nombre", "date": "Date", "liste": "Liste de choix",
+               "oui_non": "Oui / Non"}
 MONEY_FIELDS = {"montant_estime", "montant_devis", "franchise", "montant_indemnise"}
 DATE_FIELDS = {f for f in SINISTRE_FIELDS if f.startswith("date_")}
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -252,14 +261,47 @@ def clean_copro(data):
     return out
 
 
-def clean_sinistre(data):
+def parse_id(v, label):
+    if v in (None, ""):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        raise ApiError(f"Valeur invalide pour « {label} ».")
+
+
+def clean_champs_perso(defs, values):
+    """Ne garde que les champs définis par l'administrateur, valeurs contrôlées par type."""
+    values = values if isinstance(values, dict) else {}
+    out = {}
+    for d in defs:
+        v = values.get(d["cle"])
+        if v in (None, ""):
+            continue
+        label = d["libelle"]
+        if d["type"] == "nombre":
+            out[d["cle"]] = parse_money(v, label)
+        elif d["type"] == "date":
+            out[d["cle"]] = check_date(v, label)
+        elif d["type"] == "oui_non":
+            out[d["cle"]] = v in (True, "1", "oui", "true", 1)
+        elif d["type"] == "liste":
+            if v not in d["options"]:
+                raise ApiError(f"Valeur non prévue pour « {label} ».")
+            out[d["cle"]] = v
+        else:
+            out[d["cle"]] = str(v).strip()[:2000]
+    return out
+
+
+def clean_sinistre(data, conn=None):
     out = {}
     for f in SINISTRE_FIELDS:
         v = data.get(f)
         if f in MONEY_FIELDS:
             out[f] = parse_money(v, f)
-        elif f == "copropriete_id":
-            out[f] = int(v) if v not in (None, "") else None
+        elif f in ("copropriete_id", "gestionnaire_id"):
+            out[f] = parse_id(v, f)
         elif f in DATE_FIELDS:
             out[f] = check_date(v, f)
         else:
@@ -272,6 +314,14 @@ def clean_sinistre(data):
         out["date_cloture"] = date.today().isoformat()
     if out["statut"] not in STATUTS_CLOS:
         out["date_cloture"] = ""
+    if conn is not None:
+        for f, table, label in (("copropriete_id", "coproprietes", "Copropriété"),
+                                ("gestionnaire_id", "utilisateurs", "Gestionnaire")):
+            if out[f] and not conn.execute(f"SELECT 1 FROM {table} WHERE id = ?",
+                                           (out[f],)).fetchone():
+                raise ApiError(f"{label} introuvable.")
+        out["champs_perso"] = json.dumps(
+            clean_champs_perso(get_champs(conn), data.get("champs_perso")), ensure_ascii=False)
     return out
 
 
@@ -397,6 +447,59 @@ def count_admins(conn, exclude=None):
 
 
 # --------------------------------------------------------------------------- #
+# Champs personnalisés (définis par l'administrateur)
+# --------------------------------------------------------------------------- #
+def get_champs(conn):
+    row = conn.execute("SELECT valeur FROM parametres WHERE cle = 'champs_perso'").fetchone()
+    try:
+        return json.loads(row["valeur"]) if row else []
+    except json.JSONDecodeError:
+        return []
+
+
+def slugify(text):
+    import unicodedata
+    t = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "_", t).strip("_")[:40] or "champ"
+
+
+def clean_champs_defs(conn, defs):
+    if not isinstance(defs, list) or len(defs) > 50:
+        raise ApiError("Liste de champs invalide.")
+    existing = {d["cle"] for d in get_champs(conn)}
+    out, seen = [], set()
+    for d in defs:
+        if not isinstance(d, dict):
+            raise ApiError("Champ invalide.")
+        libelle = str(d.get("libelle") or "").strip()[:80]
+        if not libelle:
+            raise ApiError("Chaque champ doit avoir un libellé.")
+        ftype = d.get("type")
+        if ftype not in CHAMP_TYPES:
+            raise ApiError(f"Type invalide pour « {libelle} ».")
+        cle = d.get("cle") if d.get("cle") in existing else None
+        if not cle:  # nouveau champ : clé stable dérivée du libellé
+            base = cle = slugify(libelle)
+            n = 2
+            while cle in seen or cle in existing:
+                cle = f"{base}_{n}"
+                n += 1
+        if cle in seen:
+            raise ApiError("Champ en double.")
+        seen.add(cle)
+        options = []
+        if ftype == "liste":
+            raw = d.get("options") or []
+            if isinstance(raw, str):
+                raw = raw.split(",")
+            options = list(dict.fromkeys(str(o).strip()[:80] for o in raw if str(o).strip()))
+            if not options:
+                raise ApiError(f"Indiquez les choix possibles pour « {libelle} ».")
+        out.append({"cle": cle, "libelle": libelle, "type": ftype, "options": options})
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Accès aux données
 # --------------------------------------------------------------------------- #
 def next_reference(conn):
@@ -421,22 +524,36 @@ def list_coproprietes(conn):
 
 
 SINISTRE_SELECT = """
-    SELECT s.*, c.nom AS copropriete_nom,
+    SELECT s.*, c.nom AS copropriete_nom, g.nom AS gestionnaire_nom,
            (SELECT MAX(j.date) FROM journal j WHERE j.sinistre_id = s.id) AS derniere_action,
            (SELECT COUNT(*) FROM documents d WHERE d.sinistre_id = s.id) AS nb_documents
     FROM sinistres s LEFT JOIN coproprietes c ON c.id = s.copropriete_id
+                     LEFT JOIN utilisateurs g ON g.id = s.gestionnaire_id
 """
 
 
-def list_sinistres(conn):
-    return [dict(r) for r in conn.execute(SINISTRE_SELECT + " ORDER BY s.created_at DESC")]
+def sinistre_row(row):
+    s = dict(row)
+    try:
+        s["champs_perso"] = json.loads(s.get("champs_perso") or "{}")
+    except json.JSONDecodeError:
+        s["champs_perso"] = {}
+    return s
+
+
+def list_sinistres(conn, gestionnaire_id=None):
+    sql, args = SINISTRE_SELECT, []
+    if gestionnaire_id:
+        sql += " WHERE s.gestionnaire_id = ?"
+        args.append(gestionnaire_id)
+    return [sinistre_row(r) for r in conn.execute(sql + " ORDER BY s.created_at DESC", args)]
 
 
 def get_sinistre(conn, sid):
     row = conn.execute(SINISTRE_SELECT + " WHERE s.id = ?", (sid,)).fetchone()
     if not row:
         raise NotFound("Sinistre introuvable.")
-    s = dict(row)
+    s = sinistre_row(row)
     s["journal"] = [dict(r) for r in conn.execute(
         "SELECT j.*, u.nom AS auteur FROM journal j LEFT JOIN utilisateurs u ON u.id = j.auteur_id "
         "WHERE j.sinistre_id = ? ORDER BY j.date DESC, j.id DESC", (sid,))]
@@ -461,7 +578,9 @@ def add_journal(conn, sid, jtype, commentaire, jdate=None, auteur_id=None):
 
 
 def create_sinistre(conn, data, user=None):
-    s = clean_sinistre(data)
+    if "gestionnaire_id" not in data and user:
+        data = {**data, "gestionnaire_id": user["id"]}  # par défaut : le créateur du dossier
+    s = clean_sinistre(data, conn)
     s["reference"] = next_reference(conn)
     s["created_at"] = s["updated_at"] = now_iso()
     cols = list(s)
@@ -479,7 +598,7 @@ def update_sinistre(conn, sid, data, user=None):
     old = conn.execute("SELECT statut, date_cloture FROM sinistres WHERE id = ?", (sid,)).fetchone()
     if not old:
         raise NotFound("Sinistre introuvable.")
-    s = clean_sinistre(data)
+    s = clean_sinistre(data, conn)
     if s["statut"] in STATUTS_CLOS and old["date_cloture"] and not data.get("date_cloture"):
         s["date_cloture"] = old["date_cloture"]
     s["updated_at"] = now_iso()
@@ -494,9 +613,9 @@ def delete_sinistre_files(conn, sid):
     shutil.rmtree(os.path.join(DOCS_DIR, str(sid)), ignore_errors=True)
 
 
-def compute_stats(conn):
+def compute_stats(conn, gestionnaire_id=None):
     today = date.today().isoformat()
-    sinistres = list_sinistres(conn)
+    sinistres = list_sinistres(conn, gestionnaire_id)
     ouverts = [s for s in sinistres if s["statut"] not in STATUTS_CLOS]
     par_statut = {st: 0 for st in STATUTS}
     par_type = {}
@@ -526,7 +645,8 @@ def compute_stats(conn):
 
 
 CSV_COLUMNS = [
-    ("reference", "Référence"), ("copropriete_nom", "Copropriété"), ("type", "Type"),
+    ("reference", "Référence"), ("copropriete_nom", "Copropriété"),
+    ("gestionnaire_nom", "Gestionnaire"), ("numero_lot", "N° de lot"), ("type", "Type"),
     ("statut", "Statut"), ("date_survenance", "Date survenance"),
     ("date_constat", "Date constat"), ("date_declaration", "Date déclaration"),
     ("localisation", "Localisation"), ("parties", "Parties"), ("declarant", "Déclarant"),
@@ -546,13 +666,22 @@ def export_csv(conn):
     buf = io.StringIO()
     buf.write("﻿")  # BOM : Excel lit correctement les accents
     w = csv.writer(buf, delimiter=";")
-    w.writerow([label for _, label in CSV_COLUMNS])
+    champs = get_champs(conn)
+    w.writerow([label for _, label in CSV_COLUMNS] + [c["libelle"] for c in champs])
+    fmt_num = lambda v: f"{v:.2f}".replace(".", ",")  # noqa: E731
     for s in list_sinistres(conn):
         row = []
         for key, _ in CSV_COLUMNS:
             v = s.get(key)
             if key in MONEY_FIELDS and v is not None:
-                v = f"{v:.2f}".replace(".", ",")
+                v = fmt_num(v)
+            row.append("" if v is None else v)
+        for c in champs:
+            v = s["champs_perso"].get(c["cle"])
+            if c["type"] == "oui_non" and v is not None:
+                v = "Oui" if v else "Non"
+            elif c["type"] == "nombre" and v is not None:
+                v = fmt_num(v)
             row.append("" if v is None else v)
         w.writerow(row)
     return buf.getvalue().encode("utf-8")
@@ -781,12 +910,28 @@ def api_params_update(ctx):
 def api_meta(ctx):
     return {"types": TYPES, "statuts": STATUTS, "statuts_clos": sorted(STATUTS_CLOS),
             "journal_types": JOURNAL_TYPES, "doc_categories": DOC_CATEGORIES,
+            "champ_types": CHAMP_TYPES,
             "max_upload": MAX_UPLOAD}
 
 
 @route("GET", "/api/stats")
 def api_stats(ctx):
-    return compute_stats(ctx.conn)
+    g = ctx.query.get("gestionnaire", [""])[0]
+    return compute_stats(ctx.conn, parse_id(g, "gestionnaire"))
+
+
+@route("GET", "/api/champs")
+def api_champs(ctx):
+    return get_champs(ctx.conn)
+
+
+@route("PUT", "/api/champs", admin=True)
+def api_champs_update(ctx):
+    defs = clean_champs_defs(ctx.conn, ctx.json().get("champs"))
+    ctx.conn.execute("INSERT INTO parametres (cle, valeur) VALUES ('champs_perso', ?) "
+                     "ON CONFLICT(cle) DO UPDATE SET valeur = excluded.valeur",
+                     (json.dumps(defs, ensure_ascii=False),))
+    return defs
 
 
 @route("GET", "/api/export.csv")

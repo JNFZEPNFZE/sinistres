@@ -75,6 +75,55 @@ async function api(path, options = {}) {
   return data;
 }
 
+/* Champs personnalisés : saisie et affichage */
+function champInput(def, value) {
+  const name = `cp:${def.cle}`;
+  const id = `cp-${def.cle}`;
+  const val = value ?? "";
+  let field;
+  if (def.type === "liste")
+    field = `<select id="${id}" name="${name}"><option value="">—</option>${def.options
+      .map((o) => `<option ${o === val ? "selected" : ""}>${esc(o)}</option>`)
+      .join("")}</select>`;
+  else if (def.type === "oui_non")
+    field = `<select id="${id}" name="${name}"><option value="">—</option><option value="1" ${val === true ? "selected" : ""}>Oui</option><option value="0" ${val === false ? "selected" : ""}>Non</option></select>`;
+  else {
+    const type = { nombre: "number", date: "date" }[def.type] || "text";
+    field = `<input id="${id}" name="${name}" type="${type}" ${type === "number" ? 'step="any"' : ""} value="${esc(val)}">`;
+  }
+  return `<div><label for="${id}">${esc(def.libelle)}</label>${field}</div>`;
+}
+function champDisplay(def, v) {
+  if (v === undefined || v === null || v === "") return "";
+  if (def.type === "oui_non") return v ? "Oui" : "Non";
+  if (def.type === "date") return fmtDate(v);
+  if (def.type === "nombre") return Number(v).toLocaleString("fr-FR");
+  return esc(v);
+}
+function extractChamps(data, champs) {
+  const out = {};
+  const types = Object.fromEntries(champs.map((c) => [c.cle, c.type]));
+  for (const k of Object.keys(data)) {
+    if (!k.startsWith("cp:")) continue;
+    const cle = k.slice(3);
+    const v = data[k];
+    if (v !== "") out[cle] = types[cle] === "oui_non" ? v === "1" : v;
+    delete data[k];
+  }
+  data.champs_perso = out;
+  return data;
+}
+function gestionnaireOptions(users, sel, { all = true } = {}) {
+  return `${all ? `<option value="">Tous les gestionnaires</option><option value="moi" ${sel === "moi" ? "selected" : ""}>Mes dossiers</option>` : ""}
+    ${users.filter((u) => u.actif || String(u.id) === String(sel)).map((u) => `<option value="${u.id}" ${String(u.id) === String(sel) ? "selected" : ""}>${esc(u.nom)}</option>`).join("")}`;
+}
+function prefGet(k, def) {
+  try { return localStorage.getItem(k) ?? def; } catch { return def; }
+}
+function prefSet(k, v) {
+  try { localStorage.setItem(k, v); } catch { /* stockage indisponible */ }
+}
+
 function badge(statut) {
   let cls = "";
   if (statut === "Clôturé") cls = "clos";
@@ -283,6 +332,12 @@ async function viewUsers(editId = null) {
         )
         .join("")}</tbody>
     </table></div>
+    <div class="card">
+      <h2>Champs personnalisés des dossiers</h2>
+      <p class="muted">Ajoutez les informations propres à votre cabinet. Elles apparaissent dans le formulaire
+      (« Informations complémentaires »), la fiche et l'export Excel.</p>
+      <div id="champs-editor"></div>
+    </div>
     <form id="pform" class="card">
       <h2>Coordonnées du cabinet (en-tête des courriers)</h2>
       <div class="form-grid">
@@ -315,6 +370,7 @@ async function viewUsers(editId = null) {
     }
   };
   document.getElementById("u-cancel")?.addEventListener("click", () => viewUsers());
+  champsEditor(document.getElementById("champs-editor"), await api("/champs"));
   document.getElementById("pform").onsubmit = async (e) => {
     e.preventDefault();
     try {
@@ -327,13 +383,67 @@ async function viewUsers(editId = null) {
   $app.querySelectorAll("[data-uedit]").forEach((b) => b.addEventListener("click", () => viewUsers(Number(b.dataset.uedit))));
 }
 
+function champsEditor(el, champs) {
+  const types = META.champ_types;
+  const save = async (list) => {
+    try {
+      champs = await api("/champs", { method: "PUT", body: { champs: list } });
+      toast("Champs enregistrés.");
+      render();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  };
+  const render = () => {
+    el.innerHTML = `
+      ${champs.length ? `<div class="table-wrap"><table><thead><tr><th>Libellé</th><th>Type</th><th>Choix</th><th></th></tr></thead><tbody>
+        ${champs.map((c, i) => `<tr>
+          <td><input data-lib="${i}" value="${esc(c.libelle)}"></td>
+          <td>${esc(types[c.type])}</td>
+          <td>${c.type === "liste" ? `<input data-opt="${i}" value="${esc(c.options.join(", "))}">` : "—"}</td>
+          <td class="actions">
+            <button class="btn small" data-up="${i}" ${i ? "" : "disabled"} title="Monter">↑</button>
+            <button class="btn small" data-down="${i}" ${i < champs.length - 1 ? "" : "disabled"} title="Descendre">↓</button>
+            <button class="btn small danger" data-rm="${i}" title="Supprimer">✕</button>
+          </td></tr>`).join("")}
+      </tbody></table></div>
+      <button class="btn" id="ch-save" style="margin:.5rem 0 1rem">Enregistrer les libellés modifiés</button>` : '<p class="muted">Aucun champ personnalisé.</p>'}
+      <form id="ch-add" class="form-grid" style="align-items:end">
+        <div><label>Nouveau champ : libellé</label><input name="libelle" required placeholder="ex. : Référence interne"></div>
+        <div><label>Type</label><select name="type">${Object.entries(types).map(([k, l]) => `<option value="${k}">${esc(l)}</option>`).join("")}</select></div>
+        <div><label>Choix (séparés par des virgules)</label><input name="options" placeholder="pour une liste de choix"></div>
+        <div><button class="btn primary">Ajouter le champ</button></div>
+      </form>`;
+    const current = () => champs.map((c, i) => ({
+      ...c,
+      libelle: el.querySelector(`[data-lib="${i}"]`).value,
+      options: c.type === "liste" ? el.querySelector(`[data-opt="${i}"]`).value : c.options,
+    }));
+    el.querySelector("#ch-add").onsubmit = (e) => {
+      e.preventDefault();
+      save([...current(), Object.fromEntries(new FormData(e.target))]);
+    };
+    el.querySelector("#ch-save")?.addEventListener("click", () => save(current()));
+    el.querySelectorAll("[data-rm]").forEach((b) => b.addEventListener("click", () => {
+      const i = Number(b.dataset.rm);
+      if (!confirm(`Supprimer le champ « ${champs[i].libelle} » ? Les valeurs déjà saisies ne seront plus affichées.`)) return;
+      save(current().filter((_, j) => j !== i));
+    }));
+    const move = (i, d) => { const l = current(); [l[i], l[i + d]] = [l[i + d], l[i]]; save(l); };
+    el.querySelectorAll("[data-up]").forEach((b) => b.addEventListener("click", () => move(Number(b.dataset.up), -1)));
+    el.querySelectorAll("[data-down]").forEach((b) => b.addEventListener("click", () => move(Number(b.dataset.down), 1)));
+  };
+  render();
+}
+
 boot();
 
 /* ------------------------------------------------------------------ */
 /* Tableau de bord                                                     */
 /* ------------------------------------------------------------------ */
 async function viewDashboard() {
-  const st = await api("/stats");
+  const scope = prefGet("dashboard-scope", "tous");
+  const st = await api(scope === "moi" ? `/stats?gestionnaire=${ME.id}` : "/stats");
   const max = Math.max(1, ...Object.values(st.par_statut));
   const miniList = (items, empty, dateKey) =>
     items.length
@@ -347,7 +457,9 @@ async function viewDashboard() {
       : `<p class="muted">${empty}</p>`;
 
   $app.innerHTML = `
-    <h1>Tableau de bord</h1>
+    <div class="page-head"><h1>Tableau de bord</h1>
+      <select id="scope" style="width:auto"><option value="tous">Tous les dossiers</option>
+        <option value="moi" ${scope === "moi" ? "selected" : ""}>Mes dossiers</option></select></div>
     <div class="grid kpis">
       <div class="card kpi"><div class="value">${st.ouverts}</div><div class="label">Dossiers ouverts</div></div>
       <div class="card kpi ${st.en_retard.length ? "alert" : ""}"><div class="value">${st.en_retard.length}</div><div class="label">Échéances dépassées</div></div>
@@ -369,15 +481,16 @@ async function viewDashboard() {
           .join("")}
       </div>
     </div>`;
+  document.getElementById("scope").onchange = (e) => { prefSet("dashboard-scope", e.target.value); viewDashboard(); };
 }
 
 /* ------------------------------------------------------------------ */
 /* Liste des sinistres                                                 */
 /* ------------------------------------------------------------------ */
-const listState = { q: "", copro: "", statut: "ouverts", type: "", sort: "created_at", dir: -1 };
+const listState = { q: "", copro: "", statut: "ouverts", type: "", gest: "", sort: "created_at", dir: -1 };
 
 async function viewList() {
-  const [sinistres, copros] = await Promise.all([api("/sinistres"), api("/coproprietes")]);
+  const [sinistres, copros, users] = await Promise.all([api("/sinistres"), api("/coproprietes"), api("/utilisateurs")]);
   const opt = (v, l, sel) => `<option value="${esc(v)}" ${v === sel ? "selected" : ""}>${esc(l)}</option>`;
 
   $app.innerHTML = `
@@ -393,11 +506,12 @@ async function viewList() {
       <select id="f-copro">${opt("", "Toutes les copropriétés", listState.copro)}${copros.map((c) => opt(String(c.id), c.nom, listState.copro)).join("")}</select>
       <select id="f-statut">${opt("ouverts", "Dossiers ouverts", listState.statut)}${opt("", "Tous les statuts", listState.statut)}${META.statuts.map((s) => opt(s, s, listState.statut)).join("")}</select>
       <select id="f-type">${opt("", "Tous les types", listState.type)}${META.types.map((t) => opt(t, t, listState.type)).join("")}</select>
+      <select id="f-gest">${gestionnaireOptions(users, listState.gest)}</select>
     </div>
     <div class="card table-wrap" style="padding:0"><table>
       <thead><tr>
         <th data-sort="reference">Réf.</th><th data-sort="copropriete_nom">Copropriété</th>
-        <th data-sort="type">Type</th><th data-sort="localisation">Localisation</th>
+        <th data-sort="type">Type</th><th data-sort="localisation">Localisation</th><th data-sort="gestionnaire_nom">Gestionnaire</th>
         <th data-sort="date_survenance">Survenance</th><th data-sort="statut">Statut</th>
         <th data-sort="date_echeance">Échéance</th><th class="num" data-sort="montant_estime">Estimé</th>
       </tr></thead>
@@ -412,8 +526,10 @@ async function viewList() {
       if (listState.statut === "ouverts" && isClos(s)) return false;
       if (listState.statut && listState.statut !== "ouverts" && s.statut !== listState.statut) return false;
       if (listState.type && s.type !== listState.type) return false;
+      if (listState.gest === "moi" && s.gestionnaire_id !== ME.id) return false;
+      if (listState.gest && listState.gest !== "moi" && String(s.gestionnaire_id) !== listState.gest) return false;
       if (q) {
-        const hay = [s.reference, s.copropriete_nom, s.localisation, s.declarant, s.tiers, s.numero_sinistre_assureur, s.description, s.expert, s.entreprise]
+        const hay = [s.reference, s.copropriete_nom, s.localisation, s.numero_lot, s.declarant, s.tiers, s.numero_sinistre_assureur, s.description, s.expert, s.entreprise, ...Object.values(s.champs_perso || {})]
           .join(" ").toLowerCase();
         if (!hay.includes(q)) return false;
       }
@@ -429,12 +545,12 @@ async function viewList() {
           .map(
             (s) => `<tr data-id="${s.id}">
         <td><strong>${esc(s.reference)}</strong>${s.nb_documents ? ` <span class="muted" title="${s.nb_documents} document(s)">📎${s.nb_documents}</span>` : ""}</td><td>${esc(s.copropriete_nom || "—")}</td>
-        <td>${esc(s.type)}</td><td>${esc(s.localisation)}</td><td>${fmtDate(s.date_survenance)}</td>
+        <td>${esc(s.type)}</td><td>${esc(s.localisation)}${s.numero_lot ? ` <span class="muted">(lot ${esc(s.numero_lot)})</span>` : ""}</td><td>${esc(s.gestionnaire_nom || "—")}</td><td>${fmtDate(s.date_survenance)}</td>
         <td>${badge(s.statut)}</td><td class="${isLate(s) ? "late" : ""}">${fmtDate(s.date_echeance)}</td>
         <td class="num">${fmtMoney(s.montant_estime)}</td></tr>`
           )
           .join("")
-      : `<tr><td colspan="8" class="muted">Aucun sinistre ne correspond aux filtres.</td></tr>`;
+      : `<tr><td colspan="9" class="muted">Aucun sinistre ne correspond aux filtres.</td></tr>`;
     document.getElementById("count").textContent = `${rows.length} dossier(s) affiché(s) sur ${sinistres.length}.`;
   };
 
@@ -442,6 +558,7 @@ async function viewList() {
   document.getElementById("f-copro").addEventListener("change", (e) => { listState.copro = e.target.value; render(); });
   document.getElementById("f-statut").addEventListener("change", (e) => { listState.statut = e.target.value; render(); });
   document.getElementById("f-type").addEventListener("change", (e) => { listState.type = e.target.value; render(); });
+  document.getElementById("f-gest").addEventListener("change", (e) => { listState.gest = e.target.value; render(); });
   document.querySelectorAll("th[data-sort]").forEach((th) =>
     th.addEventListener("click", () => {
       listState.dir = listState.sort === th.dataset.sort ? -listState.dir : 1;
@@ -472,7 +589,8 @@ function delaiDeclaration(s) {
 }
 
 async function viewDetail(id) {
-  const s = await api(`/sinistres/${id}`);
+  const [s, champs] = await Promise.all([api(`/sinistres/${id}`), api("/champs")]);
+  const perso = champs.map((d) => [d, champDisplay(d, s.champs_perso[d.cle])]).filter(([, v]) => v);
   const row = (label, val) => (val ? `<dt>${label}</dt><dd>${val}</dd>` : "");
   const alerte = !isClos(s) ? delaiDeclaration(s) : null;
   const solde = s.montant_indemnise != null && s.montant_devis != null ? s.montant_devis - s.montant_indemnise : null;
@@ -481,7 +599,7 @@ async function viewDetail(id) {
     <div class="page-head">
       <div>
         <h1>${esc(s.reference)} — ${esc(s.type)}</h1>
-        <div class="actions">${badge(s.statut)} <span class="muted">${esc(s.copropriete_nom || "Sans copropriété")}${s.localisation ? " · " + esc(s.localisation) : ""}</span></div>
+        <div class="actions">${badge(s.statut)} <span class="muted">${esc(s.copropriete_nom || "Sans copropriété")}${s.localisation ? " · " + esc(s.localisation) : ""}${s.numero_lot ? ` · lot n° ${esc(s.numero_lot)}` : ""} · suivi par ${esc(s.gestionnaire_nom || "personne")}</span></div>
       </div>
       <div class="actions">
         <a class="btn" href="#/sinistres">← Liste</a>
@@ -504,6 +622,7 @@ async function viewDetail(id) {
         ${row("Contact", esc(s.declarant_contact))}
         ${row("Tiers / responsable", esc(s.tiers))}
         ${row("Description", esc(s.description))}
+        ${perso.map(([d, v]) => row(esc(d.libelle), v)).join("")}
       </dl></div>
       <div class="card"><h2>Assurance & expertise</h2><dl class="details">
         ${row("Assureur", esc(s.assureur))}
@@ -695,9 +814,11 @@ function bindDocs(s, reload) {
 /* Formulaire sinistre                                                 */
 /* ------------------------------------------------------------------ */
 async function viewForm(id) {
-  const [copros, s] = await Promise.all([
+  const [copros, users, champs, s] = await Promise.all([
     api("/coproprietes"),
-    id ? api(`/sinistres/${id}`) : Promise.resolve({ statut: "À déclarer", type: "Dégât des eaux", parties: "Communes", date_constat: today() }),
+    api("/utilisateurs"),
+    api("/champs"),
+    id ? api(`/sinistres/${id}`) : Promise.resolve({ statut: "À déclarer", type: "Dégât des eaux", parties: "Communes", date_constat: today(), gestionnaire_id: ME.id, champs_perso: {} }),
   ]);
   const v = (k) => esc(s[k] ?? "");
   const opts = (list, sel) => list.map((x) => `<option value="${esc(x)}" ${x === sel ? "selected" : ""}>${esc(x || "—")}</option>`).join("");
@@ -714,8 +835,13 @@ async function viewForm(id) {
         <div><label for="type">Type de sinistre *</label><select id="type" name="type">${opts(META.types, s.type)}</select></div>
         <div><label for="statut">Statut *</label><select id="statut" name="statut">${opts(META.statuts, s.statut)}</select></div>
         <div><label for="parties">Parties concernées</label><select id="parties" name="parties">${opts(["Communes", "Privatives", "Communes et privatives"], s.parties)}</select></div>
-        ${input("localisation", "Localisation (bât., étage, lot, local…)", "text", 'class="full"')}
+        ${input("localisation", "Localisation (bâtiment, étage, local…)")}
+        ${input("numero_lot", "N° de lot")}
+        <div><label for="gestionnaire_id">Gestionnaire du dossier</label><select id="gestionnaire_id" name="gestionnaire_id">
+          <option value="">—</option>${gestionnaireOptions(users, s.gestionnaire_id, { all: false })}</select></div>
       </div></fieldset>
+      ${champs.length ? `<fieldset><legend>Informations complémentaires</legend><div class="form-grid">
+        ${champs.map((d) => champInput(d, s.champs_perso[d.cle])).join("")}</div></fieldset>` : ""}
 
       <fieldset><legend>Dates</legend><div class="form-grid">
         ${input("date_survenance", "Date de survenance", "date")}
@@ -790,7 +916,7 @@ async function viewForm(id) {
 
   form.onsubmit = async (e) => {
     e.preventDefault();
-    const data = Object.fromEntries(new FormData(form));
+    const data = extractChamps(Object.fromEntries(new FormData(form)), champs);
     try {
       const saved = id
         ? await api(`/sinistres/${id}`, { method: "PUT", body: data })

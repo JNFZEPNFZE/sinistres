@@ -37,7 +37,11 @@ L'administrateur ajoute ensuite les comptes de ses collègues depuis le menu « 
   traçage automatique des changements de statut.
 - **Alertes de délai de déclaration** (5 jours ouvrés en général, 2 jours ouvrés pour le vol)
   et **suggestion de tranche IRSI** pour les dégâts des eaux selon le montant estimé.
-- **Recherche et filtres** (copropriété, statut, type, texte libre), tri par colonne.
+- **Gestionnaire du dossier** (par défaut : la personne qui le crée) et **n° de lot** ;
+  filtre « Mes dossiers » sur la liste et le tableau de bord.
+- **Champs personnalisés** définis par l'administrateur (texte, nombre, date, liste de
+  choix, oui/non) : affichés dans le formulaire, la fiche, la recherche et l'export Excel.
+- **Recherche et filtres** (copropriété, statut, type, gestionnaire, texte libre), tri par colonne.
 - **Export Excel / CSV** (séparateur `;`, accents compatibles Excel).
 - **Fiche imprimable** (bouton « Imprimer » → PDF via le navigateur).
 - Gestion des **copropriétés** (assureur MRI, n° de police, courtier) ; l'assureur est

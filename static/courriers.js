@@ -31,7 +31,7 @@ const MODELES = [
       <ul>
         <li><strong>Nature :</strong> ${esc(s.type)}</li>
         <li><strong>Date de survenance :</strong> ${h.d(s.date_survenance, "date de survenance")}${s.date_constat && s.date_constat !== s.date_survenance ? ` (constaté le ${dateLongue(s.date_constat)})` : ""}</li>
-        <li><strong>Localisation :</strong> ${h.v(s.localisation, "localisation")} — parties ${esc((s.parties || "communes").toLowerCase())}</li>
+        <li><strong>Localisation :</strong> ${h.v(s.localisation, "localisation")}${s.numero_lot ? ` (lot n° ${esc(s.numero_lot)})` : ""} — parties ${esc((s.parties || "communes").toLowerCase())}</li>
         <li><strong>Circonstances :</strong> ${s.description ? h.br(s.description) : h.blank("circonstances")}</li>
         ${s.tiers ? `<li><strong>Origine / responsable présumé :</strong> ${esc(s.tiers)}</li>` : ""}
         ${s.montant_estime != null ? `<li><strong>Estimation provisoire des dommages :</strong> ${fmtMoney(s.montant_estime)} HT</li>` : ""}

@@ -1,0 +1,26 @@
+# Service systemd : démarrage automatique de l'application sur un serveur Linux.
+# Installation :
+#   sudo useradd --system --home /opt/sinistres sinistres
+#   sudo cp -r . /opt/sinistres && sudo chown -R sinistres: /opt/sinistres
+#   sudo cp deploiement/sinistres.service /etc/systemd/system/
+#   sudo systemctl enable --now sinistres
+[Unit]
+Description=Suivi des sinistres (copropriété)
+After=network.target
+
+[Service]
+User=sinistres
+WorkingDirectory=/opt/sinistres
+ExecStart=/usr/bin/python3 /opt/sinistres/app.py 8000
+Environment=SINISTRES_HOST=127.0.0.1
+Environment=SINISTRES_COOKIE_SECURE=1
+Environment=SINISTRES_TRUST_PROXY=1
+Environment=SINISTRES_QUIET=1
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/sinistres
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

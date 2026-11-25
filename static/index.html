@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Suivi des sinistres</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="anon">
+  <header class="topbar">
+    <div class="brand">Suivi des sinistres</div>
+    <nav>
+      <a href="#/" data-nav="dashboard">Tableau de bord</a>
+      <a href="#/sinistres" data-nav="sinistres">Sinistres</a>
+      <a href="#/coproprietes" data-nav="coproprietes">Copropriétés</a>
+    </nav>
+    <a class="btn primary" href="#/sinistres/nouveau">+ Nouveau sinistre</a>
+    <div id="usermenu" class="usermenu"></div>
+  </header>
+  <main id="app"><p class="muted">Chargement…</p></main>
+  <div id="toast" class="toast" hidden></div>
+  <script src="courriers.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
